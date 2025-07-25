@@ -1,24 +1,16 @@
 import os
 import json
 import logging
+import asyncio
+import signal
+import threading
 from logging.handlers import RotatingFileHandler
 from exchange import OkxExchange
 from bot import SmartBot
 
-# Настройка логирования
-logger = logging.getLogger("SmartBot_v1")
-logger.setLevel(logging.INFO)
 
-formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(name)s - %(message)s')
-console_handler = logging.StreamHandler()
-console_handler.setFormatter(formatter)
-logger.addHandler(console_handler)
 
-file_handler = RotatingFileHandler("SmartBot_v1.log", maxBytes=5 * 1024 * 1024, backupCount=3)
-file_handler.setFormatter(formatter)
-logger.addHandler(file_handler)
-
-# Загрузка конфигурации из JSON
+# Загрузка конфигурации
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "okx_config.json")
 if not os.path.exists(CONFIG_PATH):
     logger.error(f"Конфигурационный файл не найден: {CONFIG_PATH}")
@@ -37,9 +29,20 @@ ORDER_AMOUNT_USDT = config.get("order_amount_usdt", 10)
 LEVERAGE = config.get("leverage", 10)
 DEMO_MODE = config.get("demo", True)
 
-# Запуск бота
+
+
+def print_banner():
+    print("\n" + "="*50)
+    print(" SmartBot v1 - Управление торговым ботом")
+    print("="*50)
+    print(" Доступные команды:")
+    print(" - start: Запустить бота")
+    print(" - stop: Остановить бота")
+    print(" - status: Показать статус бота")
+    print(" - exit: Выйти из программы")
+    print("="*50 + "\n")
+
 if __name__ == '__main__':
-    exchange = OkxExchange(API_KEY, SECRET_KEY, PASSPHRASE, demo=DEMO_MODE)
-    bot = SmartBot(exchange, SYMBOL, GRID_NUM, GRID_STEP_PCT, ORDER_AMOUNT_USDT, LEVERAGE)
-    bot.run()
-    
+    print_banner()
+    session = Session()
+    session.run()
