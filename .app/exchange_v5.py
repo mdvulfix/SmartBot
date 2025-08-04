@@ -12,7 +12,8 @@ from decimal import Decimal, ROUND_DOWN
 from datetime import datetime, timezone
 from typing import Any, Tuple, Optional, List, Dict
 from aiohttp import ClientSession as Session, ClientTimeout as Timeout
-from utils import Utils  # Предполагается, что этот модуль существует
+from utils import Utils
+
 
 class ExchangeState(Enum):
     DISCONNECTED = auto()
@@ -126,8 +127,6 @@ class OkxExchange(Exchange):
 
         # precision cache
         self._symbol_precision_cache: Dict[str, Tuple[int, int]] = {}
-        # Instrument cache for min size and lot size
-        self._instrument_cache: Dict[str, Dict[str, Decimal]] = {}
 
         # run/stop control
         self._stop_event: Optional[asyncio.Event] = None
@@ -140,7 +139,6 @@ class OkxExchange(Exchange):
             self._logger.warning("Running in LIVE TRADING mode")
 
         self._notifier = None
-        self.balance = Decimal("0")
 
     # ----------------------------------------------------------------
     # Run / Stop
@@ -254,42 +252,23 @@ class OkxExchange(Exchange):
 
         url = self._base_url + path
 
-        # Prepare query parameters for GET requests
-        if method.upper() == "GET" and payload:
-            # Сортируем параметры и кодируем их
-            sorted_params = sorted(payload.items(), key=lambda x: x[0])
-            encoded_params = "&".join(f"{k}={v}" for k, v in sorted_params)
-            full_url = f"{url}?{encoded_params}"
+        # prepare body and params so signature matches exactly
+        if method.upper() == "GET" or payload is None:
             body = ""
+            params = payload if method.upper() == "GET" else None
+            data = None
         else:
-            full_url = url
-            body = json.dumps(payload, separators=(",", ":")) if payload else ""
-            encoded_params = ""
+            body = json.dumps(payload, separators=(",", ":"))
+            params = None
+            data = body
 
-        # Для подписи используем полный путь с параметрами для GET
-        sign_path = f"{path}?{encoded_params}" if method.upper() == "GET" and payload else path
-
-        # Генерируем timestamp в правильном формате
-        now = datetime.now(timezone.utc)
-        timestamp = now.strftime('%Y-%m-%dT%H:%M:%S') + f".{now.microsecond // 1000:03d}Z"
-        
-        # Формируем сообщение для подписи
-        message = f"{timestamp}{method.upper()}{sign_path}{body}"
-        self._logger.debug(f"Signing message: {message}")
-        
-        # Создаем подпись
-        signature = base64.b64encode(
-            hmac.new(
-                self._secret_key.encode('utf-8'),
-                message.encode('utf-8'),
-                hashlib.sha256
-            ).digest()
-        ).decode('utf-8')
+        ts = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+        signature = self._sign(ts, method, path, body)
 
         headers = {
             "OK-ACCESS-KEY": self._api_key,
             "OK-ACCESS-SIGN": signature,
-            "OK-ACCESS-TIMESTAMP": timestamp,
+            "OK-ACCESS-TIMESTAMP": ts,
             "OK-ACCESS-PASSPHRASE": self._passphrase,
             "Content-Type": "application/json",
             **({"x-simulated-trading": "1"} if self._mode else {}),
@@ -299,24 +278,15 @@ class OkxExchange(Exchange):
 
         for attempt in range(1, 4):
             try:
-                request_params = {
-                    "method": method,
-                    "url": full_url,
-                    "headers": headers,
-                    "timeout": Timeout(total=10)
-                }
-
-                if method.upper() == "POST" and body:
-                    request_params["data"] = body
-                elif method.upper() == "GET" and payload:
-                    # Для GET параметры уже в URL
-                    pass
-                else:
-                    request_params["json"] = payload if payload else None
-
-                async with self._session.request(**request_params) as resp:
-                    data = await resp.json()
-                    self._logger.debug(f"Response: {data}")
+                async with self._session.request(
+                    method, url,
+                    params=params,
+                    data=data,
+                    headers=headers,
+                    timeout=Timeout(total=10)
+                ) as resp:
+                    data_json = await resp.json()
+                    self._logger.debug(f"Response: {data_json}")
 
                     if resp.status in {429, 502, 503}:
                         retry_after = int(resp.headers.get("Retry-After", 2 ** attempt))
@@ -324,10 +294,10 @@ class OkxExchange(Exchange):
                         await asyncio.sleep(retry_after)
                         continue
 
-                    ok = (resp.status == 200 and data.get("code") == "0")
+                    ok = (resp.status == 200 and data_json.get("code") == "0")
                     if not ok:
-                        self._logger.error(f"API error {resp.status}: {data.get('code')} – {data.get('msg')}")
-                    return data.get("data", []), ok
+                        self._logger.error(f"API error {resp.status}: {data_json.get('code')} – {data_json.get('msg')}")
+                    return data_json.get("data", []), ok
 
             except (asyncio.TimeoutError, aiohttp.ClientError) as e:
                 self._logger.error(f"Network error [{method} {path}] attempt {attempt}: {e}")
@@ -341,183 +311,126 @@ class OkxExchange(Exchange):
 
     async def get_balance(self, ccy: str = "USDT") -> Optional[Decimal]:
         data, ok = await self.request("GET", "/api/v5/account/balance")
-        if not ok or not isinstance(data, list) or not data:
+        if not ok or not isinstance(data, list):
             self._logger.error("Invalid balance response")
             return None
 
-        # Обрабатываем структуру ответа OKX
-        try:
-            for account in data:
-                details = account.get("details", [])
-                for detail in details:
-                    if detail.get("ccy") == ccy:
-                        avail_bal = detail.get("availBal", "0")
-                        return Decimal(avail_bal)
-        except Exception as e:
-            self._logger.error(f"Error parsing balance: {e}")
-        
-        self._logger.warning(f"Currency {ccy} not found in balance data")
+        found: Optional[Decimal] = None
+        for acct in data:
+            balances = {bal.get("ccy"): bal.get("availBal") for bal in acct.get("details", [])}
+            self._logger.info(f"AccountType={acct.get('accountType')} balances: {balances}")
+            if ccy in balances:
+                try:
+                    found = Decimal(balances[ccy])
+                except:
+                    self._logger.error(f"Cannot parse balance for {ccy}: {balances[ccy]}")
+                    found = Decimal("0")
+
+        if found is not None:
+            self._logger.info(f"Available {ccy}: {found}")
+            return found
+
+        self._logger.warning(f"Currency {ccy} not found")
         return Decimal("0")
 
     async def get_symbol_price(self, symbol: str) -> Decimal:
         data, ok = await self.request("GET", "/api/v5/market/ticker", {"instId": symbol})
-        if not ok or not data or not isinstance(data, list):
-            self._logger.error(f"Invalid ticker response for {symbol}")
-            return Decimal("0")
-        
-        try:
-            last_price = data[0].get("last")
-            return Decimal(last_price) if last_price else Decimal("0")
-        except Exception as e:
-            self._logger.error(f"Error parsing price for {symbol}: {e}")
-            return Decimal("0")
+        if not ok or not data:
+            raise ValueError(f"Invalid response for {symbol}: {data}")
+        return Decimal(data[0].get("last"))
 
-    async def get_instrument_details(self, symbol: str) -> Dict[str, Decimal]:
-        """Получает и кэширует параметры инструмента"""
-        if symbol in self._instrument_cache:
-            return self._instrument_cache[symbol]
+    async def get_symbol_precision(self, symbol: str) -> Tuple[int, int]:
+        if symbol in self._symbol_precision_cache:
+            return self._symbol_precision_cache[symbol]
 
-        # Определяем тип инструмента по символу
-        inst_type = "SWAP" if "SWAP" in symbol else "SPOT"
-        
         data, ok = await self.request(
             "GET", "/api/v5/public/instruments",
-            {"instType": inst_type, "instId": symbol}
+            {"instType": "SPOT", "instId": symbol}
         )
-        
-        if not ok or not data or not isinstance(data, list):
-            self._logger.error(f"Failed to get instrument details for {symbol}")
-            return {
-                "minSz": Decimal("0.01"),
-                "lotSz": Decimal("0.01"),
-                "tickSz": Decimal("0.01")
-            }
+        if not ok or not data:
+            return 8, 8
 
-        try:
-            instrument = data[0]
-            details = {
-                "minSz": Decimal(instrument.get("minSz", "0.01")),
-                "lotSz": Decimal(instrument.get("lotSz", "0.01")),
-                "tickSz": Decimal(instrument.get("tickSz", "0.01"))
-            }
-            self._instrument_cache[symbol] = details
-            return details
-        except Exception as e:
-            self._logger.error(f"Error parsing instrument details: {e}")
-            return {
-                "minSz": Decimal("0.01"),
-                "lotSz": Decimal("0.01"),
-                "tickSz": Decimal("0.01")
-            }
+        instr = data[0]
+        tick = len(instr.get("tickSz", "0").split(".")[-1])
+        lot = len(instr.get("lotSz", "0").split(".")[-1])
+        self._symbol_precision_cache[symbol] = (tick, lot)
+        return tick, lot
 
-    async def place_order(
-        self,
-        symbol: str,
-        side: str,
-        price: Decimal,
-        size: Optional[Decimal] = None,
-        notional: Optional[Decimal] = None,
-        trade_mode: str = "isolated"
-    ) -> Optional[str]:
-        # Получаем параметры инструмента
-        instrument = await self.get_instrument_details(symbol)
-        min_size = instrument["minSz"]
-        lot_size = instrument["lotSz"]
-        tick_size = instrument["tickSz"]
-
-        # Если указана сумма, а не размер
+    async def place_order(self, symbol: str, side: str, price: Decimal, size: Optional[Decimal] = None, notional: Optional[Decimal] = None, trade_mode: str = "isolated") -> Optional[str]:
+        # if notional given, compute contract size
         if notional is not None:
-            # Для SWAP используем ctVal
-            if "SWAP" in symbol:
-                ct_val = Decimal("1")  # По умолчанию для линейных контрактов
-                # Для обратных контрактов ctVal может быть другим
-                if "-USD-" in symbol:
-                    ct_val = Decimal("100")  # Пример для BTC-USD-SWAP
-                
-                # Рассчитываем размер на основе суммы
-                size = notional / (price * ct_val)
-            else:
-                # Для SPOT просто делим сумму на цену
-                size = notional / price
-        
+            inst_data, ok = await self.request("GET", "/api/v5/public/instruments",{"instType": "SWAP", "instId": symbol})
+            if not ok or not inst_data:
+                self._logger.error(f"Failed to fetch ctVal for {symbol}")
+                return None
+            ct_val = Decimal(inst_data[0].get("ctVal"))
+            raw = notional / (price * ct_val)
+            contracts = raw.to_integral_value(rounding=ROUND_DOWN)
+            if contracts < 1:
+                self._logger.error(f"Notional {notional} too small at price {price}")
+                return None
+            size = contracts
+            self._logger.debug(f"Computed size from notional: {notional} → sz={size}")
+
         if size is None:
             self._logger.error("Either size or notional must be provided")
             return None
 
-        # Корректируем размер ордера
-        original_size = size
-        if size < min_size:
-            size = min_size
-        else:
-            # Округляем до ближайшего кратного lot_size
-            size = (size // lot_size) * lot_size
-
-        # Корректируем цену
-        price = (price // tick_size) * tick_size
-
-        # Формируем тело запроса
+        px_prec, sz_prec = await self.get_symbol_precision(symbol)
         payload = {
             "instId": symbol,
             "tdMode": trade_mode,
-            "side": side.upper(),
+            "side": side,
             "ordType": "limit",
-            "px": str(price),
-            "sz": str(size),
+            "px": f"{price:.{px_prec}f}",
+            "sz": f"{size:.{sz_prec}f}",
             "ccy": "USDT",
         }
 
-        # Логируем корректировки
-        if original_size != size:
-            self._logger.info(f"Adjusted size: {original_size} → {size} (min: {min_size}, lot: {lot_size})")
-
         data, ok = await self.request("POST", "/api/v5/trade/order", payload)
-        if ok and data and isinstance(data, list):
+        if ok and data:
             ord_id = data[0].get("ordId")
-            if ord_id:
-                self._logger.info(f"Order placed: {ord_id}")
-                return ord_id
+            self._logger.info(f"Order placed: {ord_id}")
+            return ord_id
 
         self._logger.error(f"Order failed: {data}")
         return None
 
     async def cancel_order(self, symbol: str, order_id: str) -> bool:
-        payload = {"instId": symbol, "ordId": order_id}
-        data, ok = await self.request("POST", "/api/v5/trade/cancel-order", payload)
+        """
+        Отменяем один ордер через single‑endpoint.
+        """
+        inst_id = symbol if "-" in symbol else f"{symbol}-USDT-SWAP"
+        payload = {"instId": inst_id, "ordId": order_id}
+
+        data, ok = await self.request(
+            "POST", "/api/v5/trade/cancel-order", payload
+        )
 
         if ok:
             self._logger.info(f"Order cancelled: {order_id}")
             return True
-        
-        self._logger.error(f"Cancel failed: {data}")
-        return False
+        else:
+            self._logger.error(f"Cancel failed: {data}")
+            return False
         
     async def cancel_all_orders(self, symbol: str) -> List[str]:
-        # Получаем активные ордера
-        data, ok = await self.request("GET", "/api/v5/trade/orders-pending", {"instId": symbol})
-        if not ok or not data:
-            return []
-
-        # Формируем список ордеров для отмены
-        orders_to_cancel = [{"instId": symbol, "ordId": order["ordId"]} for order in data]
-        
-        if not orders_to_cancel:
-            return []
-
-        # Отменяем пачкой
-        cancel_data, ok = await self.request("POST", "/api/v5/trade/cancel-batch-orders", orders_to_cancel)
+        inst_id = symbol if "-" in symbol else f"{symbol}-USDT-SWAP"
+        data, ok = await self.request(
+            "POST", "/api/v5/trade/cancel-batch-orders", [{"instId": inst_id}]
+        )
         if not ok:
+            self._logger.error(f"Cancel all failed: {data}")
             return []
-
-        # Собираем успешно отмененные ордера
-        canceled = [item["ordId"] for item in cancel_data if item.get("sCode") == "0"]
-        self._logger.info(f"Canceled {len(canceled)} orders")
+        canceled = [item.get("ordId") for item in data if item.get("sCode") == "0"]
+        self._logger.info(f"Canceled all orders: {canceled}")
         return canceled
 
     async def get_status_report(self) -> Dict[str, Any]:
         return {
             "state": self._state.name,
             "last_update": self._last_update.isoformat() if self._last_update else None,
-            "balance": str(self.balance),
+            "balance": str(getattr(self, "balance", None)),
             "is_operational": self._state in {
                 ExchangeState.ACTIVE,
                 ExchangeState.CONNECTED,
@@ -530,6 +443,12 @@ class OkxExchange(Exchange):
     # ----------------------------------------------------------------
     # Helpers
     # ----------------------------------------------------------------
+    def _sign(self, timestamp: str, method: str, path: str, body: str) -> str:
+        message = f"{timestamp}{method.upper()}{path}{body}"
+        self._logger.debug(f"Signing message: {message}")
+        mac = hmac.new(self._secret_key.encode(), message.encode(), hashlib.sha256)
+        return base64.b64encode(mac.digest()).decode()
+
     def _update_state(self, new_state: ExchangeState):
         if self._state != new_state:
             now = datetime.utcnow()
