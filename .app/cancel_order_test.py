@@ -121,7 +121,7 @@ if __name__ == "__main__":
     print("Open orders:", get_open_orders("BTC-USDT-SWAP"))
     print("Cancelling order...")
     cancel_result = cancel_futures_order_demo(
-        ord_id="2728067338649313280",
+        ord_id="2728545178658381824",
         symbol="BTC-USDT-SWAP"
     )
     print("Cancel result:", cancel_result)

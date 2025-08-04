@@ -160,24 +160,14 @@ def cancel_futures_order_demo(
     return response.json()
 
 if __name__ == "__main__":
-
-
     # Пример вызова с КОРРЕКТНЫМ символом
-    # result = place_futures_limit_order_demo(
-    #     symbol="BTC-USDT-SWAP",  # Исправленный символ для перпетуального контракта
-    #     side="buy",              # Покупка
-    #     price=55500.0,           # Цена в USDT
-    #     size=1,                  # 1 контракт
-    #     td_mode="cross",         # Кросс-маржинальный режим
-    #     # pos_side не передаем (по умолчанию 'net')
-    # )
-
-    # print(result)
-
-    # Пример вызова с отладочной информацией
-    print("Cancelling order...")
-    cancel_result = cancel_futures_order_demo(
-        ord_id="2728067338649313280",
-        symbol="BTC-USDT-SWAP"
+    result = place_futures_limit_order_demo(
+         symbol="BTC-USDT-SWAP",  # Исправленный символ для перпетуального контракта
+         side="buy",              # Покупка
+         price=55500.0,           # Цена в USDT
+         size=1,                  # 1 контракт
+         td_mode="cross",         # Кросс-маржинальный режим
+         # pos_side не передаем (по умолчанию 'net')
     )
-    print("Cancel result:", cancel_result)
+
+    print(result)
