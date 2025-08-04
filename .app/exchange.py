@@ -6,13 +6,13 @@ import json
 import asyncio
 import contextlib
 import aiohttp
+import logging
 from enum import Enum, auto
 from abc import ABC, abstractmethod
 from decimal import Decimal, ROUND_DOWN
 from datetime import datetime, timezone
 from typing import Any, Tuple, Optional, List, Dict
 from aiohttp import ClientSession as Session, ClientTimeout as Timeout
-from utils import Utils  # Предполагается, что этот модуль существует
 
 class ExchangeState(Enum):
     DISCONNECTED = auto()
@@ -90,7 +90,13 @@ RUN_DURATION_SECONDS = 5 * 60  # 5 minutes
 
 class OkxExchange(Exchange):
     def __init__(self, symbols: Optional[List[str]] = None):
-        self._logger = Utils.get_logger("okx_exchange")
+        self._logger = logging.getLogger("okx_exchange")
+        self._logger.setLevel(logging.INFO)
+        if not self._logger.handlers:
+            handler = logging.StreamHandler()
+            formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+            handler.setFormatter(formatter)
+            self._logger.addHandler(handler)
 
         # load config
         config_path = os.path.join(os.path.dirname(__file__), "okx_config.json")
@@ -132,6 +138,7 @@ class OkxExchange(Exchange):
         # run/stop control
         self._stop_event: Optional[asyncio.Event] = None
         self._run_task: Optional[asyncio.Task] = None
+        self._closing = False  # Флаг закрытия
 
         # log mode
         if self._mode:
@@ -146,8 +153,8 @@ class OkxExchange(Exchange):
     # Run / Stop
     # ----------------------------------------------------------------
     async def run(self, interval_seconds: int = CHECK_HEALTH_INTERVAL, duration_seconds: int = RUN_DURATION_SECONDS):
-        if self._run_task and not self._run_task.done():
-            self._logger.warning("Run loop already active")
+        if self._closing or (self._run_task and not self._run_task.done()):
+            self._logger.warning("Run loop already active or exchange is closing")
             return
 
         if self._stop_event is None:
@@ -162,19 +169,21 @@ class OkxExchange(Exchange):
         async def _loop():
             try:
                 while self._stop_event is not None and not self._stop_event.is_set() and (asyncio.get_event_loop().time() - start) < duration_seconds:
+                    if self._closing:
+                        break
                     await self.check_health()
                     await asyncio.sleep(interval_seconds)
             except asyncio.CancelledError:
                 self._logger.info("Run loop cancelled")
             finally:
-                await self.close()
+                if not self._closing:
+                    await self.close()
                 self._logger.info("Run loop finished")
 
         self._run_task = asyncio.create_task(_loop())
 
     async def stop(self):
-        if not self._run_task or self._run_task.done():
-            await self.close()
+        if self._closing or not self._run_task or self._run_task.done():
             return
         self._logger.info("Stopping run loop")
         if self._stop_event is not None:
@@ -182,12 +191,14 @@ class OkxExchange(Exchange):
         self._run_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await self._run_task
-        await self.close()
 
     # ----------------------------------------------------------------
     # Connection / Health
     # ----------------------------------------------------------------
     async def connect(self) -> bool:
+        if self._closing:
+            return False
+            
         self._update_state(ExchangeState.CONNECTING)
         try:
             if self._session and not self._session.closed:
@@ -208,6 +219,9 @@ class OkxExchange(Exchange):
 
     async def check_health(self):
         try:
+            if self._closing:
+                return
+                
             if self._state in {ExchangeState.DISCONNECTED, ExchangeState.NETWORK_ERROR}:
                 await self.connect()
 
@@ -239,6 +253,15 @@ class OkxExchange(Exchange):
             self._update_state(ExchangeState.UNKNOWN)
 
     async def close(self):
+        if self._closing:
+            return
+            
+        self._closing = True
+        
+        # Остановить фоновые задачи
+        await self.stop()
+        
+        # Закрыть сессию
         if self._session and not self._session.closed:
             await self._session.close()
             self._logger.info("Session closed")
@@ -249,6 +272,10 @@ class OkxExchange(Exchange):
     # Core API
     # ----------------------------------------------------------------
     async def request(self, method: str, path: str, payload: Any = None) -> Tuple[Any, bool]:
+        if self._closing:
+            self._logger.warning("Skipping request, exchange is closing")
+            return [], False
+            
         if not self._session or self._session.closed:
             self._session = Session(timeout=Timeout(total=10))
 
@@ -340,6 +367,9 @@ class OkxExchange(Exchange):
         return [], False
 
     async def get_balance(self, ccy: str = "USDT") -> Optional[Decimal]:
+        if self._closing:
+            return None
+            
         data, ok = await self.request("GET", "/api/v5/account/balance")
         if not ok or not isinstance(data, list) or not data:
             self._logger.error("Invalid balance response")
@@ -360,6 +390,9 @@ class OkxExchange(Exchange):
         return Decimal("0")
 
     async def get_symbol_price(self, symbol: str) -> Decimal:
+        if self._closing:
+            return Decimal("0")
+            
         data, ok = await self.request("GET", "/api/v5/market/ticker", {"instId": symbol})
         if not ok or not data or not isinstance(data, list):
             self._logger.error(f"Invalid ticker response for {symbol}")
@@ -374,6 +407,15 @@ class OkxExchange(Exchange):
 
     async def get_instrument_details(self, symbol: str) -> Dict[str, Decimal]:
         """Получает и кэширует параметры инструмента"""
+        if self._closing:
+            return {
+                "minSz": Decimal("0.01"),
+                "lotSz": Decimal("0.01"),
+                "tickSz": Decimal("0.01"),
+                "ctVal": Decimal("1"),
+                "ctType": "linear"
+            }
+            
         if symbol in self._instrument_cache:
             return self._instrument_cache[symbol]
 
@@ -390,7 +432,9 @@ class OkxExchange(Exchange):
             return {
                 "minSz": Decimal("0.01"),
                 "lotSz": Decimal("0.01"),
-                "tickSz": Decimal("0.01")
+                "tickSz": Decimal("0.01"),
+                "ctVal": Decimal("1"),
+                "ctType": "linear"
             }
 
         try:
@@ -398,7 +442,9 @@ class OkxExchange(Exchange):
             details = {
                 "minSz": Decimal(instrument.get("minSz", "0.01")),
                 "lotSz": Decimal(instrument.get("lotSz", "0.01")),
-                "tickSz": Decimal(instrument.get("tickSz", "0.01"))
+                "tickSz": Decimal(instrument.get("tickSz", "0.01")),
+                "ctVal": Decimal(instrument.get("ctVal", "1")),
+                "ctType": instrument.get("ctType", "linear")
             }
             self._instrument_cache[symbol] = details
             return details
@@ -407,7 +453,9 @@ class OkxExchange(Exchange):
             return {
                 "minSz": Decimal("0.01"),
                 "lotSz": Decimal("0.01"),
-                "tickSz": Decimal("0.01")
+                "tickSz": Decimal("0.01"),
+                "ctVal": Decimal("1"),
+                "ctType": "linear"
             }
 
     async def place_order(
@@ -419,56 +467,56 @@ class OkxExchange(Exchange):
         notional: Optional[Decimal] = None,
         trade_mode: str = "isolated"
     ) -> Optional[str]:
+        if self._closing:
+            return None
+            
         # Получаем параметры инструмента
         instrument = await self.get_instrument_details(symbol)
         min_size = instrument["minSz"]
         lot_size = instrument["lotSz"]
         tick_size = instrument["tickSz"]
+        ct_val = instrument["ctVal"]
+        ct_type = instrument["ctType"]
 
-        # Если указана сумма, а не размер
+        # Автоматическая коррекция режима торговли для SPOT
+        if "SPOT" in symbol and trade_mode != "cash":
+            trade_mode = "cash"
+            self._logger.info("Auto-corrected trade_mode to 'cash' for SPOT instrument")
+
+        # Расчет размера по номиналу
         if notional is not None:
-            # Для SWAP используем ctVal
             if "SWAP" in symbol:
-                ct_val = Decimal("1")  # По умолчанию для линейных контрактов
-                # Для обратных контрактов ctVal может быть другим
-                if "-USD-" in symbol:
-                    ct_val = Decimal("100")  # Пример для BTC-USD-SWAP
-                
-                # Рассчитываем размер на основе суммы
+                if ct_type == "inverse":
+                    self._logger.error("Notional calculation not supported for inverse contracts")
+                    return None
                 size = notional / (price * ct_val)
             else:
-                # Для SPOT просто делим сумму на цену
                 size = notional / price
         
         if size is None:
-            self._logger.error("Either size or notional must be provided")
+            self._logger.error("Size must be specified")
             return None
 
-        # Корректируем размер ордера
-        original_size = size
+        # Проверка минимального размера
         if size < min_size:
+            self._logger.info(f"Size adjusted to minimum: {size} -> {min_size}")
             size = min_size
-        else:
-            # Округляем до ближайшего кратного lot_size
-            size = (size // lot_size) * lot_size
-
-        # Корректируем цену
+        
+        # Корректировка размера и цены
+        size = (size // lot_size) * lot_size
         price = (price // tick_size) * tick_size
 
-        # Формируем тело запроса
+        # Формирование запроса
         payload = {
             "instId": symbol,
             "tdMode": trade_mode,
-            "side": side.upper(),
+            "side": side.lower(),
             "ordType": "limit",
             "px": str(price),
             "sz": str(size),
-            "ccy": "USDT",
         }
-
-        # Логируем корректировки
-        if original_size != size:
-            self._logger.info(f"Adjusted size: {original_size} → {size} (min: {min_size}, lot: {lot_size})")
+        
+        self._logger.info(f"Placing order: {symbol} {side} {price} {size}")
 
         data, ok = await self.request("POST", "/api/v5/trade/order", payload)
         if ok and data and isinstance(data, list):
@@ -481,6 +529,9 @@ class OkxExchange(Exchange):
         return None
 
     async def cancel_order(self, symbol: str, order_id: str) -> bool:
+        if self._closing:
+            return False
+            
         payload = {"instId": symbol, "ordId": order_id}
         data, ok = await self.request("POST", "/api/v5/trade/cancel-order", payload)
 
@@ -492,6 +543,9 @@ class OkxExchange(Exchange):
         return False
         
     async def cancel_all_orders(self, symbol: str) -> List[str]:
+        if self._closing:
+            return []
+            
         # Получаем активные ордера
         data, ok = await self.request("GET", "/api/v5/trade/orders-pending", {"instId": symbol})
         if not ok or not data:

@@ -4,7 +4,21 @@ import asyncio
 from decimal import Decimal, InvalidOperation
 
 from exchange import OkxExchange
-from coin import Coin
+
+class Coin:
+    def __init__(self, base: str, quote: str = "USDT", instrument_type: str = "SWAP"):
+        self.base = base
+        self.quote = quote
+        self.instrument_type = instrument_type
+    
+    @property
+    def instrument_id(self) -> str:
+        if self.instrument_type == "SPOT":
+            return f"{self.base}-{self.quote}"
+        elif self.instrument_type == "SWAP":
+            return f"{self.base}-{self.quote}-SWAP"
+        else:
+            return f"{self.base}-{self.quote}-{self.instrument_type}"
 
 HELP_TEXT = """
     Доступные команды:
@@ -23,10 +37,10 @@ HELP_TEXT = """
 
 # Определяем, с какими монетами работаем
 COINS = {
-    "BTC": Coin("BTC"),
-    "ETH": Coin("ETH"),
-    "SOL": Coin("SOL"),
-    "XRP": Coin("XRP")
+    "BTC": Coin("BTC", instrument_type="SWAP"),
+    "ETH": Coin("ETH", instrument_type="SWAP"),
+    "SOL": Coin("SOL", instrument_type="SWAP"),
+    "XRP": Coin("XRP", instrument_type="SWAP")
 }
 
 async def command_loop():
@@ -50,8 +64,8 @@ async def command_loop():
 
             elif cmd == "coins":
                 print("Торгуемые монеты:")
-                for coin in COINS.values():
-                    print(f"  {coin.base}/{coin.quote}  →  {coin.instrument_id}")
+                for name, coin in COINS.items():
+                    print(f"  {name} ({coin.instrument_type}) → {coin.instrument_id}")
             
             elif cmd == "start":
                 if worker and not worker.done():
@@ -86,61 +100,109 @@ async def command_loop():
                 if not coin:
                     print(f"❌ Монета {base} не поддерживается")
                     continue
-                instrument_id = coin.instrument_id
                 try:
-                    price = await exchange.get_symbol_price(instrument_id)
-                    print(f"Цена {instrument_id}: {price}")
+                    price = await exchange.get_symbol_price(coin.instrument_id)
+                    print(f"Цена {coin.instrument_id}: {price}")
                 except Exception as e:
                     print(f"❌ Ошибка получения цены: {e}")
 
             elif cmd == "order":
-                if len(parts) != 5:
-                    print("Использование: order SYMBOL SIDE PRICE SIZE")
+                if len(parts) < 5:
+                    print("Использование: order SYMBOL SIDE PRICE [SIZE|AMOUNT]")
+                    print("Пример: order BTC buy 50000 0.01   (размер)")
+                    print("Или:    order BTC buy 50000 500    (сумма в USDT)")
                     continue
-                symbol, side, price_s, size_s = parts[1:]
+                
+                symbol, side, price_s, size_s = parts[1:5]
                 coin = COINS.get(symbol.upper())
                 if not coin:
                     print(f"❌ Монета {symbol} не поддерживается")
                     continue
+                    
                 try:
                     price = Decimal(price_s)
-                    size = Decimal(size_s)
+                    size_or_amt = Decimal(size_s)
                 except InvalidOperation:
-                    print("❌ Некорректный формат PRICE или SIZE")
+                    print("❌ Некорректный формат PRICE или SIZE/AMOUNT")
                     continue
+                
+                # Определяем что передано: размер или сумма
+                is_amount = len(parts) > 5 and parts[5].lower() == "amt"
+                
                 instrument_id = coin.instrument_id
-                order_id = await exchange.place_order(instrument_id, side, price, size)
+                if is_amount:
+                    order_id = await exchange.place_order(
+                        instrument_id, 
+                        side, 
+                        price,
+                        notional=size_or_amt
+                    )
+                else:
+                    order_id = await exchange.place_order(
+                        instrument_id, 
+                        side, 
+                        price,
+                        size=size_or_amt
+                    )
+                    
                 if order_id:
                     print(f"✅ Ордер размещён, ID={order_id}")
                 else:
                     print("❌ Не удалось разместить ордер")
 
             elif cmd == "cancel":
-                if len(parts) != 3:
+                if len(parts) < 3:
                     print("Использование: cancel SYMBOL ORDER_ID")
                     continue
-                symbol, order_id = parts[1], parts[2]
-                ok = await exchange.cancel_order(symbol, order_id)
+                symbol = parts[1].upper()
+                order_id = parts[2]
+                
+                coin = COINS.get(symbol)
+                if not coin:
+                    print(f"❌ Монета {symbol} не поддерживается")
+                    continue
+                    
+                ok = await exchange.cancel_order(coin.instrument_id, order_id)
                 print("✅ Отменено" if ok else "❌ Не удалось отменить")
 
             elif cmd == "cancel_all":
-                if len(parts) != 2:
+                if len(parts) < 2:
                     print("Использование: cancel_all SYMBOL")
                     continue
-                symbol = parts[1]
-                canceled = await exchange.cancel_all_orders(symbol)
-                print(f"✅ Отменены ордера: {canceled}" if canceled else "❌ Нет отменённых ордеров")
+                symbol = parts[1].upper()
+                
+                coin = COINS.get(symbol)
+                if not coin:
+                    print(f"❌ Монета {symbol} не поддерживается")
+                    continue
+                    
+                canceled = await exchange.cancel_all_orders(coin.instrument_id)
+                if canceled:
+                    print(f"✅ Отменены ордера: {', '.join(canceled)}")
+                else:
+                    print("❌ Нет активных ордеров для отмены")
 
             elif cmd == "status":
                 report = await exchange.get_status_report()
                 print("📝 Статус биржи:")
-                for k, v in report.items():
-                    print(f"  {k}: {v}")
+                print(f"  Состояние: {report['state']}")
+                print(f"  Последнее обновление: {report['last_update']}")
+                print(f"  Баланс USDT: {report['balance']}")
+                print(f"  Операционный: {'Да' if report['is_operational'] else 'Нет'}")
+                print(f"  Требует внимания: {'Да' if report['needs_attention'] else 'Нет'}")
+                print("  История состояний:")
+                for state in report['state_history']:
+                    print(f"    - {state['timestamp']}: {state['from']} → {state['to']}")
 
             elif cmd == "quit":
                 if worker and not worker.done():
                     print("⏳ Останавливаю перед выходом...")
                     await exchange.stop()
+                    # Дать время на завершение операций
+                    await asyncio.sleep(0.5)
+                
+                # Явно закрыть соединение
+                await exchange.close()
                 print("👋 До встречи!")
                 break
 
