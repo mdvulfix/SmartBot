@@ -5,8 +5,9 @@ import base64
 import json
 import os
 from datetime import datetime, timezone
+from urllib.parse import urlencode, quote
 
-class OKXDemoExchange:
+class OKXExchange:
     def __init__(self, config_path=None):
         """
         Инициализация подключения к демо-счету OKX
@@ -35,16 +36,7 @@ class OKXDemoExchange:
         self.secret_key = config['secret_key'].strip()
         self.passphrase = config['passphrase'].strip()
         
-    def _sign_request(self, method, endpoint, body=None):
-        """
-        Генерирует подпись и заголовки для запроса
-        
-        :param method: HTTP метод (GET, POST)
-        :param endpoint: API эндпоинт
-        :param body: Тело запроса (для POST)
-        :return: Заголовки для запроса
-        """
-        # Генерация временной метки
+    def _sign(self, method, endpoint, body=None):
         now = datetime.now(timezone.utc)
         timestamp = now.strftime('%Y-%m-%dT%H:%M:%S') + f".{now.microsecond // 1000:03d}Z"
         
@@ -76,28 +68,52 @@ class OKXDemoExchange:
         
         return headers, body_str if body else None
         
-    def _make_request(self, method, endpoint, body=None, params=None):
-        """
-        Выполняет запрос к API OKX
-        
-        :param method: HTTP метод
-        :param endpoint: API эндпоинт
-        :param body: Тело запроса (для POST)
-        :param params: Параметры запроса (для GET)
-        :return: Ответ API
-        """
-        headers, body_str = self._sign_request(method, endpoint, body)
-        
+    def _request(self, method, endpoint, body=None, params=None):
+        # Формируем полный путь для подписи (включая параметры для GET)
+        full_endpoint = endpoint
+        if method == "GET" and params:
+            # Сортируем параметры по ключу и URL-кодируем
+            sorted_params = sorted(params.items(), key=lambda x: x[0])
+            encoded_params = urlencode(sorted_params, quote_via=quote)
+            full_endpoint += "?" + encoded_params
+
+        headers, body_str = self._sign(method, full_endpoint, body)
         url = self.BASE_URL + endpoint
         
-        if method == "GET":
-            response = requests.get(url, headers=headers, params=params)
-        elif method == "POST":
-            response = requests.post(url, headers=headers, data=body_str)
-        else:
-            raise ValueError(f"Unsupported method: {method}")
+        try:
+            if method == "GET":
+                # Для GET используем отсортированные параметры
+                response = requests.get(
+                    url, 
+                    headers=headers, 
+                    params=sorted_params if params else None
+                )
+            elif method == "POST":
+                response = requests.post(url, headers=headers, data=body_str)
+            else:
+                raise ValueError(f"Unsupported method: {method}")
             
-        return response.json()
+            # Проверка HTTP статуса
+            response.raise_for_status()
+            data = response.json()
+            
+            # Проверка кода ответа OKX (0 - успех)
+            if data.get("code") != "0":
+                raise Exception(f"API error: code={data.get('code')}, msg={data.get('msg')}")
+            return data
+            
+        except requests.exceptions.RequestException as e:
+            # Расширенная обработка ошибок
+            if e.response is not None:
+                try:
+                    error_data = e.response.json()
+                    error_msg = error_data.get('msg', 'Unknown error')
+                    error_code = error_data.get('code', '')
+                    raise Exception(f"Request failed (status {e.response.status_code}): [{error_code}] {error_msg}")
+                except:
+                    raise Exception(f"Request failed (status {e.response.status_code}): {e}")
+            else:
+                raise Exception(f"Request failed: {e}")
     
     # Публичные методы API
     
@@ -114,6 +130,10 @@ class OKXDemoExchange:
         :param cl_ord_id: Клиентский ID (опционально)
         :return: Ответ API
         """
+        # Проверка типов данных
+        if not isinstance(price, (int, float)) or not isinstance(size, (int, float)):
+            raise TypeError("Price and size must be numeric types")
+            
         endpoint = "/api/v5/trade/order"
         
         # Формируем тело запроса
@@ -123,7 +143,7 @@ class OKXDemoExchange:
             "side": side,
             "ordType": "limit",
             "px": str(price),
-            "sz": str(size),
+            "sz": str(size)
         }
         
         # Добавляем опциональные параметры
@@ -132,7 +152,7 @@ class OKXDemoExchange:
         if cl_ord_id:
             body["clOrdId"] = cl_ord_id
             
-        return self._make_request("POST", endpoint, body)
+        return self._request("POST", endpoint, body)
     
     def cancel_order(self, ord_id, symbol, cl_ord_id=''):
         """
@@ -154,7 +174,7 @@ class OKXDemoExchange:
         if cl_ord_id:
             body["clOrdId"] = cl_ord_id
             
-        return self._make_request("POST", endpoint, body)
+        return self._request("POST", endpoint, body)
     
     def get_open_orders(self, symbol=''):
         """
@@ -165,16 +185,11 @@ class OKXDemoExchange:
         """
         endpoint = "/api/v5/trade/orders-pending"
         params = {"instId": symbol} if symbol else {}
-        return self._make_request("GET", endpoint, params=params)
+        return self._request("GET", endpoint, params=params)
     
     def get_balance(self):
-        """
-        Получает баланс демо-счета
-        
-        :return: Ответ API
-        """
         endpoint = "/api/v5/account/balance"
-        return self._make_request("GET", endpoint)
+        return self._request("GET", endpoint)
     
     def get_instruments(self, inst_type='FUTURES'):
         """
@@ -185,35 +200,4 @@ class OKXDemoExchange:
         """
         endpoint = "/api/v5/public/instruments"
         params = {"instType": inst_type}
-        return self._make_request("GET", endpoint, params=params)
-
-# Пример использования класса
-if __name__ == "__main__":
-    # Создаем экземпляр класса биржи
-    exchange = OKXDemoExchange()
-    
-    # Пример: Получение баланса
-    balance = exchange.get_balance()
-    print("Balance:", balance)
-    
-    # Пример: Получение активных ордеров
-    open_orders = exchange.get_open_orders("BTC-USDT-SWAP")
-    print("Open orders:", open_orders)
-    
-    # Пример: Размещение ордера
-    order_result = exchange.place_futures_limit_order(
-        symbol="BTC-USDT-SWAP",
-        side="buy",
-        price=55000,
-        size=1
-    )
-    print("Order placement result:", order_result)
-    
-    # Пример: Отмена ордера
-    if order_result.get('code') == '0':
-        ord_id = order_result['data'][0]['ordId']
-        cancel_result = exchange.cancel_order(
-            ord_id=ord_id,
-            symbol="BTC-USDT-SWAP"
-        )
-        print("Cancel result:", cancel_result)
+        return self._request("GET", endpoint, params=params)
