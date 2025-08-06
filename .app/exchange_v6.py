@@ -1,12 +1,18 @@
-import hmac, hashlib, base64, json, asyncio, aiohttp, contextlib
+import os
+import hmac
+import hashlib
+import base64
+import json
+import asyncio
+import contextlib
+import aiohttp
+import logging
 from enum import Enum, auto
 from abc import ABC, abstractmethod
 from decimal import Decimal, ROUND_DOWN
 from datetime import datetime, timezone
 from typing import Any, Tuple, Optional, List, Dict
 from aiohttp import ClientSession as Session, ClientTimeout as Timeout
-from utils import Utils
-from coin import Coin 
 
 class ExchangeState(Enum):
     DISCONNECTED = auto()
@@ -21,33 +27,38 @@ class ExchangeState(Enum):
     ORDER_ERROR = auto()
     UNKNOWN = auto()
 
+
 class Exchange(ABC):
     @abstractmethod
     async def request(self, method: str, path: str, payload: Any = None) -> Tuple[Any, bool]:
         pass
 
     @abstractmethod
-    async def get_balance(self, coin: Coin) -> Optional[Decimal]:
+    async def get_balance(self, ccy: str = "USDT") -> Optional[Decimal]:
         pass
 
     @abstractmethod
-    async def get_symbol_price(self, coin: Coin) -> Decimal:
+    async def get_symbol_price(self, symbol: str) -> Decimal:
         pass
 
     @abstractmethod
-    async def place_limit_order_by_size(self, coin: Coin, side: str, price: Decimal, size: Optional[Decimal] = None, trade_mode: str = "isolated") -> Optional[str]:
+    async def place_order(
+        self,
+        symbol: str,
+        side: str,
+        price: Decimal,
+        size: Optional[Decimal] = None,
+        notional: Optional[Decimal] = None,
+        trade_mode: str = "isolated"
+    ) -> Optional[str]:
         pass
 
     @abstractmethod
-    async def place_limit_order_by_amount(self, coin: Coin, side: str, price: Decimal, size: Optional[Decimal] = None, notional: Optional[Decimal] = None, trade_mode: str = "isolated") -> Optional[str]:
+    async def cancel_order(self, symbol: str, order_id: str) -> bool:
         pass
 
     @abstractmethod
-    async def cancel_order(self, coin: Coin, order_id: str) -> bool:
-        pass
-
-    @abstractmethod
-    async def cancel_all_orders(self, coin: Coin) -> List[str]:
+    async def cancel_all_orders(self, symbol: str) -> List[str]:
         pass
 
     @abstractmethod
@@ -55,7 +66,7 @@ class Exchange(ABC):
         pass
 
     @abstractmethod
-    async def run(self, interval: int, duration: int):
+    async def run(self, interval_seconds: int = 30, duration_seconds: int = 5 * 60):
         pass
 
     @abstractmethod
@@ -72,26 +83,40 @@ class Exchange(ABC):
     async def __aexit__(self, *_):
         await self.close()
 
+
+CHECK_HEALTH_INTERVAL = 120  # seconds
+RUN_DURATION_SECONDS = 5 * 60  # 5 minutes
+
+
 class OkxExchange(Exchange):
-    
-    CHECK_HEALTH_INTERVAL_SECONDS = 120  # seconds
-    RUN_DURATION_SECONDS = 5 * 60  # 5 minutes
-    
-    def __init__(self, config, coins: Optional[List[Coin]] = None, demo: bool = True):
-        self._logger = Utils.get_logger("okx_exchange")
+    def __init__(self, symbols: Optional[List[str]] = None):
+        self._logger = logging.getLogger("okx_exchange")
+        self._logger.setLevel(logging.INFO)
+        if not self._logger.handlers:
+            handler = logging.StreamHandler()
+            formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+            handler.setFormatter(formatter)
+            self._logger.addHandler(handler)
 
         # load config
-        self._api_key = config["api_key"].strip()
-        self._secret_key = config["secret_key"].strip()
-        self._passphrase = config["passphrase"].strip()
-        
+        config_path = os.path.join(os.path.dirname(__file__), "okx_config.json")
+        if not os.path.exists(config_path):
+            self._logger.error(f"Missing config file: {config_path}")
+            raise FileNotFoundError(config_path)
+
+        with open(config_path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+
+        self._api_key = cfg["api_key"].strip()
+        self._secret_key = cfg["secret_key"].strip()
+        self._passphrase = cfg["passphrase"].strip()
+        self._mode = cfg.get("demo", True)
 
         if not all([self._api_key, self._secret_key, self._passphrase]):
             raise ValueError("Missing API credentials in okx_config.json")
 
+        self._symbols = symbols or cfg.get("symbols", [])
         self._base_url = "https://www.okx.com"
-        
-        # session
         self._session: Optional[Session] = None
 
         # state machine
@@ -105,26 +130,29 @@ class OkxExchange(Exchange):
             ExchangeState.MAINTENANCE,
         }
 
+        # precision cache
+        self._symbol_precision_cache: Dict[str, Tuple[int, int]] = {}
+        # Instrument cache for min size and lot size
+        self._instrument_cache: Dict[str, Dict[str, Decimal]] = {}
+
         # run/stop control
         self._stop_event: Optional[asyncio.Event] = None
         self._run_task: Optional[asyncio.Task] = None
         self._closing = False  # Флаг закрытия
 
         # log mode
-        self._demo = demo
-
-        if self._demo:
+        if self._mode:
             self._logger.info("Running in DEMO mode")
         else:
             self._logger.warning("Running in LIVE TRADING mode")
 
         self._notifier = None
-        self._balance = Decimal("0")
+        self.balance = Decimal("0")
 
     # ----------------------------------------------------------------
     # Run / Stop
     # ----------------------------------------------------------------
-    async def run(self, interval: int = CHECK_HEALTH_INTERVAL_SECONDS, duration: int = RUN_DURATION_SECONDS):
+    async def run(self, interval_seconds: int = CHECK_HEALTH_INTERVAL, duration_seconds: int = RUN_DURATION_SECONDS):
         if self._closing or (self._run_task and not self._run_task.done()):
             self._logger.warning("Run loop already active or exchange is closing")
             return
@@ -136,15 +164,15 @@ class OkxExchange(Exchange):
             return
 
         start = asyncio.get_event_loop().time()
-        self._logger.info(f"Run loop started: interval={interval}s, duration={duration}s")
+        self._logger.info(f"Run loop started: interval={interval_seconds}s, duration={duration_seconds}s")
 
         async def _loop():
             try:
-                while self._stop_event is not None and not self._stop_event.is_set() and (asyncio.get_event_loop().time() - start) < duration:
+                while self._stop_event is not None and not self._stop_event.is_set() and (asyncio.get_event_loop().time() - start) < duration_seconds:
                     if self._closing:
                         break
                     await self.check_health()
-                    await asyncio.sleep(interval)
+                    await asyncio.sleep(interval_seconds)
             except asyncio.CancelledError:
                 self._logger.info("Run loop cancelled")
             finally:
@@ -338,7 +366,7 @@ class OkxExchange(Exchange):
         self._logger.error(f"Failed after 3 attempts: {method} {path}")
         return [], False
 
-    async def get_balance(self, coin: Coin) -> Optional[Decimal]:
+    async def get_balance(self, ccy: str = "USDT") -> Optional[Decimal]:
         if self._closing:
             return None
             
@@ -352,32 +380,83 @@ class OkxExchange(Exchange):
             for account in data:
                 details = account.get("details", [])
                 for detail in details:
-                    if detail.get("ccy") == coin.symbol:
+                    if detail.get("ccy") == ccy:
                         avail_bal = detail.get("availBal", "0")
                         return Decimal(avail_bal)
         except Exception as e:
             self._logger.error(f"Error parsing balance: {e}")
         
-        self._logger.warning(f"Currency {coin.symbol} not found in balance data")
+        self._logger.warning(f"Currency {ccy} not found in balance data")
         return Decimal("0")
 
-    async def get_symbol_price(self, coin: Coin) -> Decimal:
+    async def get_symbol_price(self, symbol: str) -> Decimal:
         if self._closing:
             return Decimal("0")
             
-        data, ok = await self.request("GET", "/api/v5/market/ticker", {"instId": coin.id})
+        data, ok = await self.request("GET", "/api/v5/market/ticker", {"instId": symbol})
         if not ok or not data or not isinstance(data, list):
-            self._logger.error(f"Invalid ticker response for {coin.symbol}")
+            self._logger.error(f"Invalid ticker response for {symbol}")
             return Decimal("0")
         
         try:
             last_price = data[0].get("last")
             return Decimal(last_price) if last_price else Decimal("0")
         except Exception as e:
-            self._logger.error(f"Error parsing price for {coin.symbol}: {e}")
+            self._logger.error(f"Error parsing price for {symbol}: {e}")
             return Decimal("0")
 
-    
+    async def get_instrument_details(self, symbol: str) -> Dict[str, Decimal]:
+        """Получает и кэширует параметры инструмента"""
+        if self._closing:
+            return {
+                "minSz": Decimal("0.01"),
+                "lotSz": Decimal("0.01"),
+                "tickSz": Decimal("0.01"),
+                "ctVal": Decimal("1"),
+                "ctType": "linear"
+            }
+            
+        if symbol in self._instrument_cache:
+            return self._instrument_cache[symbol]
+
+        # Определяем тип инструмента по символу
+        inst_type = "SWAP" if "SWAP" in symbol else "SPOT"
+        
+        data, ok = await self.request(
+            "GET", "/api/v5/public/instruments",
+            {"instType": inst_type, "instId": symbol}
+        )
+        
+        if not ok or not data or not isinstance(data, list):
+            self._logger.error(f"Failed to get instrument details for {symbol}")
+            return {
+                "minSz": Decimal("0.01"),
+                "lotSz": Decimal("0.01"),
+                "tickSz": Decimal("0.01"),
+                "ctVal": Decimal("1"),
+                "ctType": "linear"
+            }
+
+        try:
+            instrument = data[0]
+            details = {
+                "minSz": Decimal(instrument.get("minSz", "0.01")),
+                "lotSz": Decimal(instrument.get("lotSz", "0.01")),
+                "tickSz": Decimal(instrument.get("tickSz", "0.01")),
+                "ctVal": Decimal(instrument.get("ctVal", "1")),
+                "ctType": instrument.get("ctType", "linear")
+            }
+            self._instrument_cache[symbol] = details
+            return details
+        except Exception as e:
+            self._logger.error(f"Error parsing instrument details: {e}")
+            return {
+                "minSz": Decimal("0.01"),
+                "lotSz": Decimal("0.01"),
+                "tickSz": Decimal("0.01"),
+                "ctVal": Decimal("1"),
+                "ctType": "linear"
+            }
 
     async def place_order(
         self,
