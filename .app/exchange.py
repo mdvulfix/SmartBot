@@ -23,7 +23,7 @@ class ExchangeState(Enum):
 
 class Exchange(ABC):
     @abstractmethod
-    async def request(self, method: str, path: str, payload: Any = None) -> Tuple[Any, bool]:
+    async def _request(self, method: str, path: str, payload: Any = None) -> Tuple[Any, bool]:
         pass
 
     @abstractmethod
@@ -35,11 +35,11 @@ class Exchange(ABC):
         pass
 
     @abstractmethod
-    async def place_limit_order_by_size(self, coin: Coin, side: str, price: Decimal, size: Optional[Decimal] = None, trade_mode: str = "isolated") -> Optional[str]:
+    async def place_limit_order_by_size(self, coin: Coin, side: str, price: Decimal, size: Optional[Decimal], trade_mode: str) -> Optional[str]:
         pass
 
     @abstractmethod
-    async def place_limit_order_by_amount(self, coin: Coin, side: str, price: Decimal, size: Optional[Decimal] = None, notional: Optional[Decimal] = None, trade_mode: str = "isolated") -> Optional[str]:
+    async def place_limit_order_by_amount(self, coin: Coin, side: str, price: Decimal, notional: Optional[Decimal], trade_mode: str) -> Optional[str]:
         pass
 
     @abstractmethod
@@ -177,8 +177,8 @@ class OkxExchange(Exchange):
                 await self._session.close()
             self._session = Session(timeout=Timeout(total=10))
 
-            bal = await self.get_balance("USDT")
-            self.balance = bal or Decimal("0")
+            balance = await self.get_balance(Coin("USDT"))
+            self.balance = balance or Decimal("0")
             self._update_state(ExchangeState.CONNECTED)
             return True
         except aiohttp.ClientConnectionError:
@@ -197,22 +197,17 @@ class OkxExchange(Exchange):
             if self._state in {ExchangeState.DISCONNECTED, ExchangeState.NETWORK_ERROR}:
                 await self.connect()
 
-            bal = await self.get_balance("USDT")
-            if bal is None:
+            balance = await self.get_balance(Coin("USDT"))
+            if balance is None:
                 self._update_state(ExchangeState.API_ERROR)
                 return
-            self.balance = bal
+            self.balance = balance
 
             if self.balance < Decimal("10"):
                 self._update_state(ExchangeState.BALANCE_LOW)
             else:
                 self._update_state(ExchangeState.ACTIVE)
 
-            for sym in self._symbols:
-                price = await self.get_symbol_price(sym)
-                if price <= 0:
-                    self._update_state(ExchangeState.API_ERROR)
-                    return
         except aiohttp.ClientConnectionError:
             self._update_state(ExchangeState.NETWORK_ERROR)
         except aiohttp.ClientResponseError as e:
@@ -243,13 +238,206 @@ class OkxExchange(Exchange):
     # ----------------------------------------------------------------
     # Core API
     # ----------------------------------------------------------------
-    async def request(self, method: str, path: str, payload: Any = None) -> Tuple[Any, bool]:
+    
+
+    async def get_balance(self, coin: Coin) -> Optional[Decimal]:
+        if self._closing:
+            return None
+            
+        data, ok = await self._request("GET", "/api/v5/account/balance")
+        if not ok or not isinstance(data, list) or not data:
+            self._logger.error("Invalid balance response")
+            return None
+
+        # Обрабатываем структуру ответа OKX
+        try:
+            for account in data:
+                details = account.get("details", [])
+                for detail in details:
+                    if detail.get("ccy") == coin.symbol:
+                        available_balance = detail.get("availBal", "0")
+                        return Decimal(available_balance)
+        except Exception as e:
+            self._logger.error(f"Error parsing balance: {e}")
+        
+        self._logger.warning(f"Currency {coin.symbol} not found in balance data")
+        return Decimal("0")
+
+    async def get_symbol_price(self, coin: Coin) -> Decimal:
+        if self._closing:
+            return Decimal("0")
+            
+        data, ok = await self._request("GET", "/api/v5/market/ticker", {"instId": coin.id})
+        if not ok or not data or not isinstance(data, list):
+            self._logger.error(f"Invalid ticker response for {coin.symbol}")
+            return Decimal("0")
+        
+        try:
+            last_price = data[0].get("last")
+            return Decimal(last_price) if last_price else Decimal("0")
+        except Exception as e:
+            self._logger.error(f"Error parsing price for {coin.symbol}: {e}")
+            return Decimal("0")
+
+
+    async def place_limit_order_by_size(self, coin: Coin, side: str, price: Decimal, size: Optional[Decimal], trade_mode: str = "cross") -> Optional[str]:
+        if self._closing:
+            return None
+
+        limits = coin.get_details()
+        min_size = limits["minSz"]
+        lot_size = limits["lotSz"]
+        tick_size = limits["tickSz"]
+        ct_val = limits["ctVal"]
+        ct_type = limits["ctType"]
+    
+        if size is None:
+            self._logger.error("Size must be specified")
+            return None
+        
+        # Проверка минимального размера
+        if size < min_size:
+            self._logger.info(f"Size adjusted to minimum: {size} -> {min_size}")
+            size = min_size
+
+        # Корректировка размера и цены
+        size = (size // lot_size) * lot_size
+        price = (price // tick_size) * tick_size
+
+        # Формирование запроса
+        order = {
+            "instId": coin.symbol,
+            "tdMode": trade_mode,
+            "side": side.lower(),
+            "ordType": "limit",
+            "px": str(price),
+            "sz": str(size),
+        }
+
+        self._logger.info(f"Placing order: {coin.symbol} {side} {price} {size}")
+
+        data, ok = await self._request("POST", "/api/v5/trade/order", order)
+        if ok and data and isinstance(data, list):
+            order_id = data[0].get("ordId")
+            if order_id:
+                self._logger.info(f"Order placed: {order_id}")
+                return order_id
+
+        self._logger.error(f"Order failed: {data}")
+        return None
+
+    async def place_limit_order_by_amount(self, coin: Coin, side: str, price: Decimal, notional: Optional[Decimal], trade_mode: str = "cross") -> Optional[str]:
+        if self._closing:
+            return None
+
+        limits = coin.get_details()
+        min_size = limits["minSz"]
+        lot_size = limits["lotSz"]
+        tick_size = limits["tickSz"]
+        contract_value = limits["ctVal"]
+        contract_type = limits["ctType"]
+
+        
+        if notional is not None:
+            self._logger.error("Notional must be specified")
+            return None
+            
+        if contract_type == "inverse":
+            self._logger.error("Notional calculation not supported for inverse contracts")
+            return None
+        
+        # Расчет размера по номиналу    
+        size = notional / (price * contract_value)
+            
+        # Корректировка размера и цены
+        size = (size // lot_size) * lot_size
+        price = (price // tick_size) * tick_size
+
+        # Формирование запроса
+        order = {
+            "instId": coin.symbol,
+            "tdMode": trade_mode,
+            "side": side.lower(),
+            "ordType": "limit",
+            "px": str(price),
+            "sz": str(size),
+        }
+
+        self._logger.info(f"Placing order: {coin.symbol} {side} {price} {size}")
+
+        data, ok = await self._request("POST", "/api/v5/trade/order", order)
+        if ok and data and isinstance(data, list):
+            order_id = data[0].get("ordId")
+            if order_id:
+                self._logger.info(f"Order placed: {order_id}")
+                return order_id
+
+        self._logger.error(f"Order failed: {data}")
+        return None
+
+    async def cancel_order(self, coin: Coin, order_id: str) -> bool:
+        if self._closing:
+            return False
+            
+        order = {"instId": coin.symbol, "ordId": order_id}
+        data, ok = await self._request("POST", "/api/v5/trade/cancel-order", order)
+
+        if ok:
+            self._logger.info(f"Order cancelled: {order_id}")
+            return True
+        
+        self._logger.error(f"Cancel failed: {data}")
+        return False
+        
+    async def cancel_all_orders(self, coin: Coin) -> List[str]:
+        if self._closing:
+            return []
+            
+        # Получаем активные ордера
+        data, ok = await self._request("GET", "/api/v5/trade/orders-pending", {"instId": coin.symbol})
+        if not ok or not data:
+            return []
+
+        # Формируем список ордеров для отмены
+        orders_to_cancel = [{"instId": coin.symbol, "ordId": order["ordId"]} for order in data]
+        
+        if not orders_to_cancel:
+            return []
+
+        # Отменяем пачкой
+        cancel_data, ok = await self._request("POST", "/api/v5/trade/cancel-batch-orders", orders_to_cancel)
+        if not ok:
+            return []
+
+        # Собираем успешно отмененные ордера
+        canceled = [item["ordId"] for item in cancel_data if item.get("sCode") == "0"]
+        self._logger.info(f"Canceled {len(canceled)} orders")
+        return canceled
+
+    async def get_status_report(self) -> Dict[str, Any]:
+        return {
+            "state": self._state.name,
+            "last_update": self._last_update.isoformat() if self._last_update else None,
+            "balance": str(self.balance),
+            "is_operational": self._state in {
+                ExchangeState.ACTIVE,
+                ExchangeState.CONNECTED,
+                ExchangeState.BALANCE_LOW,
+            },
+            "needs_attention": self._state in self._critical_states,
+            "state_history": self._get_recent_history(),
+        }
+
+    # ----------------------------------------------------------------
+    # Helpers
+    # ----------------------------------------------------------------
+    async def _request(self, method: str, path: str, payload: Any = None) -> Tuple[Any, bool]:
         if self._closing:
             self._logger.warning("Skipping request, exchange is closing")
             return [], False
             
         if not self._session or self._session.closed:
-            self._session = Session(timeout=Timeout(total=10))
+            self._session = Session(timeout = Timeout(total = 10))
 
         url = self._base_url + path
 
@@ -291,7 +479,7 @@ class OkxExchange(Exchange):
             "OK-ACCESS-TIMESTAMP": timestamp,
             "OK-ACCESS-PASSPHRASE": self._passphrase,
             "Content-Type": "application/json",
-            **({"x-simulated-trading": "1"} if self._mode else {}),
+            **({"x-simulated-trading": "1"} if self._demo else {}),
         }
         if body:
             headers["Content-Length"] = str(len(body))
@@ -336,175 +524,8 @@ class OkxExchange(Exchange):
                 return [], False
 
         self._logger.error(f"Failed after 3 attempts: {method} {path}")
-        return [], False
-
-    async def get_balance(self, coin: Coin) -> Optional[Decimal]:
-        if self._closing:
-            return None
-            
-        data, ok = await self.request("GET", "/api/v5/account/balance")
-        if not ok or not isinstance(data, list) or not data:
-            self._logger.error("Invalid balance response")
-            return None
-
-        # Обрабатываем структуру ответа OKX
-        try:
-            for account in data:
-                details = account.get("details", [])
-                for detail in details:
-                    if detail.get("ccy") == coin.symbol:
-                        avail_bal = detail.get("availBal", "0")
-                        return Decimal(avail_bal)
-        except Exception as e:
-            self._logger.error(f"Error parsing balance: {e}")
-        
-        self._logger.warning(f"Currency {coin.symbol} not found in balance data")
-        return Decimal("0")
-
-    async def get_symbol_price(self, coin: Coin) -> Decimal:
-        if self._closing:
-            return Decimal("0")
-            
-        data, ok = await self.request("GET", "/api/v5/market/ticker", {"instId": coin.id})
-        if not ok or not data or not isinstance(data, list):
-            self._logger.error(f"Invalid ticker response for {coin.symbol}")
-            return Decimal("0")
-        
-        try:
-            last_price = data[0].get("last")
-            return Decimal(last_price) if last_price else Decimal("0")
-        except Exception as e:
-            self._logger.error(f"Error parsing price for {coin.symbol}: {e}")
-            return Decimal("0")
-
+        return [], False  
     
-
-    async def place_order(
-        self,
-        symbol: str,
-        side: str,
-        price: Decimal,
-        size: Optional[Decimal] = None,
-        notional: Optional[Decimal] = None,
-        trade_mode: str = "isolated"
-    ) -> Optional[str]:
-        if self._closing:
-            return None
-            
-        # Получаем параметры инструмента
-        instrument = await self.get_instrument_details(symbol)
-        min_size = instrument["minSz"]
-        lot_size = instrument["lotSz"]
-        tick_size = instrument["tickSz"]
-        ct_val = instrument["ctVal"]
-        ct_type = instrument["ctType"]
-
-        # Автоматическая коррекция режима торговли для SPOT
-        if "SPOT" in symbol and trade_mode != "cash":
-            trade_mode = "cash"
-            self._logger.info("Auto-corrected trade_mode to 'cash' for SPOT instrument")
-
-        # Расчет размера по номиналу
-        if notional is not None:
-            if "SWAP" in symbol:
-                if ct_type == "inverse":
-                    self._logger.error("Notional calculation not supported for inverse contracts")
-                    return None
-                size = notional / (price * ct_val)
-            else:
-                size = notional / price
-        
-        if size is None:
-            self._logger.error("Size must be specified")
-            return None
-
-        # Проверка минимального размера
-        if size < min_size:
-            self._logger.info(f"Size adjusted to minimum: {size} -> {min_size}")
-            size = min_size
-        
-        # Корректировка размера и цены
-        size = (size // lot_size) * lot_size
-        price = (price // tick_size) * tick_size
-
-        # Формирование запроса
-        payload = {
-            "instId": symbol,
-            "tdMode": trade_mode,
-            "side": side.lower(),
-            "ordType": "limit",
-            "px": str(price),
-            "sz": str(size),
-        }
-        
-        self._logger.info(f"Placing order: {symbol} {side} {price} {size}")
-
-        data, ok = await self.request("POST", "/api/v5/trade/order", payload)
-        if ok and data and isinstance(data, list):
-            ord_id = data[0].get("ordId")
-            if ord_id:
-                self._logger.info(f"Order placed: {ord_id}")
-                return ord_id
-
-        self._logger.error(f"Order failed: {data}")
-        return None
-
-    async def cancel_order(self, symbol: str, order_id: str) -> bool:
-        if self._closing:
-            return False
-            
-        payload = {"instId": symbol, "ordId": order_id}
-        data, ok = await self.request("POST", "/api/v5/trade/cancel-order", payload)
-
-        if ok:
-            self._logger.info(f"Order cancelled: {order_id}")
-            return True
-        
-        self._logger.error(f"Cancel failed: {data}")
-        return False
-        
-    async def cancel_all_orders(self, symbol: str) -> List[str]:
-        if self._closing:
-            return []
-            
-        # Получаем активные ордера
-        data, ok = await self.request("GET", "/api/v5/trade/orders-pending", {"instId": symbol})
-        if not ok or not data:
-            return []
-
-        # Формируем список ордеров для отмены
-        orders_to_cancel = [{"instId": symbol, "ordId": order["ordId"]} for order in data]
-        
-        if not orders_to_cancel:
-            return []
-
-        # Отменяем пачкой
-        cancel_data, ok = await self.request("POST", "/api/v5/trade/cancel-batch-orders", orders_to_cancel)
-        if not ok:
-            return []
-
-        # Собираем успешно отмененные ордера
-        canceled = [item["ordId"] for item in cancel_data if item.get("sCode") == "0"]
-        self._logger.info(f"Canceled {len(canceled)} orders")
-        return canceled
-
-    async def get_status_report(self) -> Dict[str, Any]:
-        return {
-            "state": self._state.name,
-            "last_update": self._last_update.isoformat() if self._last_update else None,
-            "balance": str(self.balance),
-            "is_operational": self._state in {
-                ExchangeState.ACTIVE,
-                ExchangeState.CONNECTED,
-                ExchangeState.BALANCE_LOW,
-            },
-            "needs_attention": self._state in self._critical_states,
-            "state_history": self._get_recent_history(),
-        }
-
-    # ----------------------------------------------------------------
-    # Helpers
-    # ----------------------------------------------------------------
     def _update_state(self, new_state: ExchangeState):
         if self._state != new_state:
             now = datetime.utcnow()
