@@ -1,9 +1,0 @@
-{
-  "api_key": "c093f67c-f68d-4f2d-b902-e30abbe2868c",
-  "secret_key": "C79498DD4B0295FB569706B62BF0410C",
-  "passphrase": "@SmartBot_v1",
-  "symbol": "BTC-USDT-SWAP",
-  "demo": true,
-  "td_mode": "cross"
-
-}
