@@ -7,42 +7,20 @@ import websocket
 from decimal import Decimal
 from threading import Thread
 import requests
-from exchange import OkxExchange
+from exchange import Exchange
 
 logger = logging.getLogger("SmartBot_v1")
 
 class SmartBot:
-    def __init__(self, client, symbol, grid_num, grid_step_pct, order_amount_usdt, leverage):
-        self.client = client
-        self.symbol = symbol
-        self.grid_num = grid_num
-        self.grid_step_pct = grid_step_pct
-        self.order_amount_usdt = order_amount_usdt
-        self.leverage = leverage
-        self.active_orders = []
-        self.grid_levels = []
-        self.reference_price = Decimal('0')
+    def __init__(self, excahge: Exchange):
+        self._excahge = excahge
 
-    def get_current_price(self):
-        endpoint = f"/api/v5/market/ticker?instId={self.symbol}"
-        res = self.client.request_with_retry("GET", endpoint)
-        if res['success']:
-            return Decimal(res['data'][0]['last'])
-        raise Exception("Failed to fetch current price")
 
-    def create_grid(self):
-        self.grid_levels.clear()
-        current_price = self.get_current_price()
-        step = Decimal(str(self.grid_step_pct)) / Decimal('100')
-        for i in range(1, self.grid_num + 1):
-            self.grid_levels.append({"price": current_price * (1 - step * i), "side": "buy"})
-            self.grid_levels.append({"price": current_price * (1 + step * i), "side": "sell"})
-        logger.info(f"Created grid with {len(self.grid_levels)} levels.")
+    def place_limit_order(self, order: LimitOrder):
+        pass
 
-    def place_order(self, level):
-        # Псевдореализация
-        logger.info(f"Placing order at {level['price']:.2f} for {level['side']}")
-        return str(int(time.time() * 1000))
+    def place_market_order(self, order: MarketOrder):
+        pass
 
     def refill_order(self, order_id):
         for info in self.active_orders:
@@ -57,14 +35,7 @@ class SmartBot:
                     logger.warning(f"Failed to re-place order for level {level['price']}, keeping old ID")
                 return
 
-    def adjust_grid(self, new_price):
-        threshold = self.grid_levels[0]['price'] * Decimal('0.05')
-        if abs(new_price - self.reference_price) > threshold:
-            logger.info("Price moved significantly, adjusting grid")
-            old_reference = self.reference_price
-            self.create_grid()
-            self.reference_price = new_price
-            logger.info(f"Grid adjusted. Reference price updated from {old_reference} to {new_price}")
+
 
     def send_telegram_alert(self, message):
         token = os.getenv("TELEGRAM_TOKEN")
