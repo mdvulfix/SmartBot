@@ -76,8 +76,8 @@ class OkxExchange(Exchange):
     
     CHECK_HEALTH_INTERVAL_SECONDS = 120  # seconds
     RUN_DURATION_SECONDS = 5 * 60  # 5 minutes
-    
-    def __init__(self, config, coins: Optional[List[Coin]] = None, demo: bool = True):
+
+    def __init__(self, config: Any, demo: bool):
         self._logger = Utils.get_logger("okx_exchange")
 
         # load config
@@ -239,7 +239,6 @@ class OkxExchange(Exchange):
     # Core API
     # ----------------------------------------------------------------
     
-
     async def get_balance(self, coin: Coin) -> Optional[Decimal]:
         if self._closing:
             return None
@@ -267,7 +266,7 @@ class OkxExchange(Exchange):
         if self._closing:
             return Decimal("0")
             
-        data, ok = await self._request("GET", "/api/v5/market/ticker", {"instId": coin.id})
+        data, ok = await self._request("GET", "/api/v5/market/ticker", {"instId": coin.symbol_id})
         if not ok or not data or not isinstance(data, list):
             self._logger.error(f"Invalid ticker response for {coin.symbol}")
             return Decimal("0")
@@ -279,18 +278,67 @@ class OkxExchange(Exchange):
             self._logger.error(f"Error parsing price for {coin.symbol}: {e}")
             return Decimal("0")
 
+    async def get_symbol_details(self, coin: Coin) -> Dict[str, Any]:
+        """Получает и кэширует параметры инструмента"""
+        if self._closing:
+            return {
+                "minSz": Decimal("0.01"),
+                "lotSz": Decimal("0.01"),
+                "tickSz": Decimal("0.01"),
+                "ctVal": Decimal("1"),
+                "ctType": "linear"
+            }
+            
+        symbol = coin.symbol
+        
+        if symbol in Coin.SYMBOL_CACHE:
+            return Coin.SYMBOL_CACHE[symbol]
 
-    async def place_limit_order_by_size(self, coin: Coin, side: str, price: Decimal, size: Optional[Decimal], trade_mode: str = "cross") -> Optional[str]:
+        # Определяем тип инструмента по символу
+        symbol_type = "SWAP"
+        data, ok = await self._request("GET", "/api/v5/public/instruments", {"instType": symbol_type, "instId": coin.symbol_id})
+        
+        if not ok or not data or not isinstance(data, list):
+            self._logger.error(f"Failed to get instrument details for {symbol}")
+            return {
+                "minSz": Decimal("0.01"),
+                "lotSz": Decimal("0.01"),
+                "tickSz": Decimal("0.01"),
+                "ctVal": Decimal("1"),
+                "ctType": "linear"
+            }
+
+        try:
+            symbol_data = data[0]
+            symbol_details = {
+                "minSz": Decimal(symbol_data.get("minSz", "0.01")),
+                "lotSz": Decimal(symbol_data.get("lotSz", "0.01")),
+                "tickSz": Decimal(symbol_data.get("tickSz", "0.01")),
+                "ctVal": Decimal(symbol_data.get("ctVal", "1")),
+                "ctType": symbol_data.get("ctType", "linear")
+            }
+            Coin.SYMBOL_CACHE[symbol] = symbol_details
+            return symbol_details
+        
+        except Exception as e:
+            self._logger.error(f"Error parsing instrument details: {e}")
+            return {
+                "minSz": Decimal("0.01"),
+                "lotSz": Decimal("0.01"),
+                "tickSz": Decimal("0.01"),
+                "ctVal": Decimal("1"),
+                "ctType": "linear"
+            }
+        
+    async def place_limit_order_by_size(self, coin: Coin, side: str, price: Decimal, size: Optional[Decimal], trade_mode: str = "isolated") -> Optional[str]:
         if self._closing:
             return None
 
-        limits = coin.get_details()
-        min_size = limits["minSz"]
-        lot_size = limits["lotSz"]
-        tick_size = limits["tickSz"]
-        ct_val = limits["ctVal"]
-        ct_type = limits["ctType"]
-    
+        details = await self.get_symbol_details(coin)
+        min_size = details["minSz"]
+        lot_size = details["lotSz"]
+        tick_size = details["tickSz"]
+
         if size is None:
             self._logger.error("Size must be specified")
             return None
@@ -306,7 +354,7 @@ class OkxExchange(Exchange):
 
         # Формирование запроса
         order = {
-            "instId": coin.symbol,
+            "instId": coin.symbol_id,
             "tdMode": trade_mode,
             "side": side.lower(),
             "ordType": "limit",
@@ -326,28 +374,27 @@ class OkxExchange(Exchange):
         self._logger.error(f"Order failed: {data}")
         return None
 
-    async def place_limit_order_by_amount(self, coin: Coin, side: str, price: Decimal, notional: Optional[Decimal], trade_mode: str = "cross") -> Optional[str]:
+    async def place_limit_order_by_amount(self, coin: Coin, side: str, price: Decimal, notional: Optional[Decimal], trade_mode: str = "isolated") -> Optional[str]:
         if self._closing:
             return None
 
-        limits = coin.get_details()
-        min_size = limits["minSz"]
-        lot_size = limits["lotSz"]
-        tick_size = limits["tickSz"]
-        contract_value = limits["ctVal"]
-        contract_type = limits["ctType"]
+        details = await self.get_symbol_details(coin)
+        min_size = details["minSz"]
+        lot_size = details["lotSz"]
+        tick_size = details["tickSz"]
+        ctVal = details["ctVal"]
+        ctType = details["ctType"]
 
-        
-        if notional is not None:
+        if notional is None:
             self._logger.error("Notional must be specified")
             return None
             
-        if contract_type == "inverse":
+        if ctType == "inverse":
             self._logger.error("Notional calculation not supported for inverse contracts")
             return None
         
         # Расчет размера по номиналу    
-        size = notional / (price * contract_value)
+        size = notional / (price * ctVal)
             
         # Корректировка размера и цены
         size = (size // lot_size) * lot_size
@@ -355,7 +402,7 @@ class OkxExchange(Exchange):
 
         # Формирование запроса
         order = {
-            "instId": coin.symbol,
+            "instId": coin.symbol_id,
             "tdMode": trade_mode,
             "side": side.lower(),
             "ordType": "limit",
@@ -379,7 +426,7 @@ class OkxExchange(Exchange):
         if self._closing:
             return False
             
-        order = {"instId": coin.symbol, "ordId": order_id}
+        order = {"instId": coin.symbol_id, "ordId": order_id}
         data, ok = await self._request("POST", "/api/v5/trade/cancel-order", order)
 
         if ok:
@@ -394,12 +441,12 @@ class OkxExchange(Exchange):
             return []
             
         # Получаем активные ордера
-        data, ok = await self._request("GET", "/api/v5/trade/orders-pending", {"instId": coin.symbol})
+        data, ok = await self._request("GET", "/api/v5/trade/orders-pending", {"instId": coin.symbol_id})
         if not ok or not data:
             return []
 
         # Формируем список ордеров для отмены
-        orders_to_cancel = [{"instId": coin.symbol, "ordId": order["ordId"]} for order in data]
+        orders_to_cancel = [{"instId": coin.symbol_id, "ordId": order["ordId"]} for order in data]
         
         if not orders_to_cancel:
             return []
@@ -428,9 +475,6 @@ class OkxExchange(Exchange):
             "state_history": self._get_recent_history(),
         }
 
-    # ----------------------------------------------------------------
-    # Helpers
-    # ----------------------------------------------------------------
     async def _request(self, method: str, path: str, payload: Any = None) -> Tuple[Any, bool]:
         if self._closing:
             self._logger.warning("Skipping request, exchange is closing")
@@ -525,6 +569,10 @@ class OkxExchange(Exchange):
 
         self._logger.error(f"Failed after 3 attempts: {method} {path}")
         return [], False  
+    
+    # ----------------------------------------------------------------
+    # Helpers
+    # ----------------------------------------------------------------
     
     def _update_state(self, new_state: ExchangeState):
         if self._state != new_state:

@@ -8,25 +8,23 @@ from coin import Coin
 
 # Определяем, с какими монетами работаем
 COINS = {
+    "USDT": Coin("USDT"),
     "BTC": Coin("BTC"),
     "ETH": Coin("ETH"),
     "SOL": Coin("SOL"),
     "XRP": Coin("XRP")
 }
 
-
-config_path = os.path.join(os.path.dirname(__file__), "okx_config.json")
-if not os.path.exists(config_path):
-    #self._logger.error(f"Missing config file: {config_path}")
-    raise FileNotFoundError(config_path)
-
-with open(config_path, "r", encoding="utf-8") as f:
-    cfg = json.load(f)
-
-
 async def command_loop():
-    # Передаём в конструктор список inst_id-ов
-    exchange = OkxExchange(COINS)
+    config_path = os.path.join(os.path.dirname(__file__), "okx_config.json")
+    if not os.path.exists(config_path):
+        #self._logger.error(f"Missing config file: {config_path}")
+        raise FileNotFoundError(config_path)
+
+    with open(config_path, "r", encoding="utf-8") as f:
+        config = json.load(f)
+
+    exchange = OkxExchange(config = config, demo = True)
     worker = None
     
     print("Интерактивный клиент OKX. Введите 'help' для списка команд.")
@@ -39,7 +37,7 @@ async def command_loop():
         cmd = parts[0].lower()
 
         try:
-            if cmd == "help":
+            if   cmd == "help":
                 help_text = """
                     Доступные команды:
                     coins --> Показать поддерживаемые символы и их id.
@@ -59,7 +57,7 @@ async def command_loop():
             elif cmd == "coins":
                 print("Торгуемые монеты:")
                 for coin in COINS.values():
-                    print(f"  {coin.id}")
+                    print(f"  {coin.symbol_id}")
             
             elif cmd == "start":
                 if worker and not worker.done():
@@ -80,12 +78,21 @@ async def command_loop():
             elif cmd == "balance":
                 inpt_symbol = parts[1] if len(parts) > 1 else "USDT"
                 symbol = inpt_symbol.upper()
-                balance = await exchange.get_balance(symbol)
-                if balance is None:
-                    print(f"❌ Не удалось получить баланс {symbol}")
-                else:
-                    print(f"💰 Баланс {symbol}: {balance}")
+                
+                coin = COINS.get(symbol)
+                if not coin:
+                    print(f"❌ Монета {symbol} не поддерживается")
+                    continue
+                try:
+                    balance = await exchange.get_balance(coin)
+                    if balance is None:
+                        print(f"❌ Не удалось получить баланс {symbol}")
+                    else:
+                        print(f"💰 Баланс {symbol}: {balance}")
 
+                except Exception as e:
+                    print(f"❌ Ошибка получения баланса: {e}")
+                
             elif cmd == "price":
                 if len(parts) < 2:
                     print("❌ Укажите монету, например: price BTC")
@@ -120,37 +127,12 @@ async def command_loop():
                 except InvalidOperation:
                     print("❌ Некорректный формат PRICE или SIZE")
                     continue
-
-                order_id = await exchange.place_limit_order_by_size(coin, inpt_side, price, size)
+                
+                side = inpt_side.lower()
+                order_id = await exchange.place_limit_order_by_size(coin, side, price, size)
                 
                 if order_id:
                     print(f"✅ Ордер размещён, ID: {order_id}")
-                else:
-                    print("❌ Не удалось разместить ордер")
-                
-
-
-                # Определяем что передано: размер или сумма
-                is_amount = len(parts) > 5 and parts[5].lower() == "amt"
-                
-                instrument_id = coin.instrument_id
-                if is_amount:
-                    order_id = await exchange.place_order(
-                        instrument_id, 
-                        side, 
-                        price,
-                        notional=size_or_amt
-                    )
-                else:
-                    order_id = await exchange.place_order(
-                        instrument_id, 
-                        side, 
-                        price,
-                        size=size_or_amt
-                    )
-                    
-                if order_id:
-                    print(f"✅ Ордер размещён, ID={order_id}")
                 else:
                     print("❌ Не удалось разместить ордер")
 
@@ -181,7 +163,6 @@ async def command_loop():
                 else:
                     print("❌ Не удалось разместить ордер")
                 
-
             elif cmd == "cancel_order":
                 if len(parts) < 3:
                     print("Использование: cancel SYMBOL ORDER_ID")

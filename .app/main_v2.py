@@ -3,8 +3,8 @@
 import asyncio
 from decimal import Decimal, InvalidOperation
 
-from exchange import OkxExchange
-from coin import Coin
+from exchange_v6 import OkxExchange
+from coin_v1 import Coin
 
 HELP_TEXT = """
     Доступные команды:
