@@ -1,3 +1,5 @@
+# === file: exchange.py ===
+
 import hmac, hashlib, base64, json, asyncio, aiohttp, contextlib
 from enum import Enum, auto
 from abc import ABC, abstractmethod
@@ -131,6 +133,9 @@ class OkxExchange(Exchange):
 
         if self._stop_event is None:
             self._stop_event = asyncio.Event()
+        else:
+            self._stop_event.clear()
+        
         if not await self.connect():
             self._logger.error("Run aborted: could not connect")
             return
@@ -178,7 +183,7 @@ class OkxExchange(Exchange):
             self._session = Session(timeout=Timeout(total=10))
 
             balance = await self.get_balance(Coin("USDT"))
-            self.balance = balance or Decimal("0")
+            self._balance = balance or Decimal("0")
             self._update_state(ExchangeState.CONNECTED)
             return True
         except aiohttp.ClientConnectionError:
@@ -201,7 +206,7 @@ class OkxExchange(Exchange):
             if balance is None:
                 self._update_state(ExchangeState.API_ERROR)
                 return
-            self.balance = balance
+            self._balance = balance
 
             if self.balance < Decimal("10"):
                 self._update_state(ExchangeState.BALANCE_LOW)
@@ -343,13 +348,13 @@ class OkxExchange(Exchange):
             self._logger.error("Size must be specified")
             return None
         
-        # Проверка минимального размера
+        # Корректировка минимального размера
+        size = (size // lot_size) * lot_size
         if size < min_size:
             self._logger.info(f"Size adjusted to minimum: {size} -> {min_size}")
             size = min_size
 
-        # Корректировка размера и цены
-        size = (size // lot_size) * lot_size
+        # Корректировка цены
         price = (price // tick_size) * tick_size
 
         # Формирование запроса
@@ -398,7 +403,11 @@ class OkxExchange(Exchange):
             
         # Корректировка размера и цены
         size = (size // lot_size) * lot_size
+        
         price = (price // tick_size) * tick_size
+        if price <= 0:
+            self._logger.error("Invalid price")
+            return None
 
         # Формирование запроса
         order = {
@@ -465,7 +474,7 @@ class OkxExchange(Exchange):
         return {
             "state": self._state.name,
             "last_update": self._last_update.isoformat() if self._last_update else None,
-            "balance": str(self.balance),
+            "balance": str(self._balance),
             "is_operational": self._state in {
                 ExchangeState.ACTIVE,
                 ExchangeState.CONNECTED,
@@ -576,7 +585,7 @@ class OkxExchange(Exchange):
     
     def _update_state(self, new_state: ExchangeState):
         if self._state != new_state:
-            now = datetime.utcnow()
+            now = datetime.now(datetime.timezone.utc)
             self._state_history.append({
                 "timestamp": now,
                 "from": self._state.name,

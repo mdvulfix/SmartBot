@@ -1,0 +1,299 @@
+import asyncio
+import logging
+from decimal import Decimal
+from typing import Dict, List, Optional, Any
+from exchange import Exchange, Coin
+
+class TradingStrategy(ABC):
+    """Абстрактный класс торговой стратегии"""
+    @abstractmethod
+    def generate_signals(self, price: Decimal, position: Decimal) -> Dict[str, Any]:
+        pass
+    
+    @abstractmethod
+    def get_risk_parameters(self) -> Dict[str, Any]:
+        pass
+    
+    @abstractmethod
+    def update_market_data(self, data: Dict[str, Any]):
+        pass
+
+class GridStrategy(TradingStrategy):
+    """Стратегия Grid Trading"""
+    def __init__(
+        self,
+        coin: Coin,
+        lower_bound: Decimal,
+        upper_bound: Decimal,
+        grid_levels: int,
+        order_size: Decimal,
+        max_orders: int = 10,
+        position_size: Decimal = Decimal('0'),
+        grid_spacing: str = 'arithmetic'
+    ):
+        self.coin = coin
+        self.lower_bound = lower_bound
+        self.upper_bound = upper_bound
+        self.grid_levels = grid_levels
+        self.order_size = order_size
+        self.max_orders = max_orders
+        self.position_size = position_size
+        self.grid_spacing = grid_spacing
+        
+        self.grid_prices: List[Decimal] = []
+        self._generate_grid_prices()
+        
+        self.logger = logging.getLogger("grid_strategy")
+        self.logger.info(f"GridStrategy initialized for {coin.symbol_id}")
+
+    def _generate_grid_prices(self):
+        """Генерация ценовых уровней сетки"""
+        self.grid_prices = []
+        
+        if self.grid_spacing == 'geometric':
+            ratio = (self.upper_bound / self.lower_bound) ** (1 / (self.grid_levels - 1))
+            for i in range(self.grid_levels):
+                price = self.lower_bound * (ratio ** i)
+                self.grid_prices.append(price)
+        else:
+            step = (self.upper_bound - self.lower_bound) / (self.grid_levels - 1)
+            for i in range(self.grid_levels):
+                price = self.lower_bound + (step * i)
+                self.grid_prices.append(price)
+        
+        # Округляем до 8 знаков для криптовалют
+        self.grid_prices = [p.quantize(Decimal('0.00000000')) for p in self.grid_prices]
+
+    def generate_signals(self, price: Decimal, position: Decimal) -> Dict[str, Any]:
+        """Генерация торговых сигналов на основе сетки"""
+        buy_levels = [p for p in self.grid_prices if p < price]
+        sell_levels = [p for p in self.grid_prices if p > price]
+        
+        return {
+            'buy_levels': buy_levels[-self.max_orders:],
+            'sell_levels': sell_levels[:self.max_orders],
+            'current_price': price,
+            'position': position
+        }
+
+    def get_risk_parameters(self) -> Dict[str, Any]:
+        """Возвращает параметры управления рисками"""
+        return {
+            'order_size': self.order_size,
+            'max_orders': self.max_orders,
+            'position_size': self.position_size
+        }
+
+    def update_market_data(self, data: Dict[str, Any]):
+        """Обновление рыночных данных (для адаптивных стратегий)"""
+        # Для базовой grid-стратегии не требуется адаптация
+        pass
+
+    def update_grid(self, lower: Decimal, upper: Decimal, levels: int):
+        """Обновление параметров сетки"""
+        self.lower_bound = lower
+        self.upper_bound = upper
+        self.grid_levels = levels
+        self._generate_grid_prices()
+        self.logger.info("Grid parameters updated")
+
+class SmartBot:
+    """Универсальный торговый бот"""
+    def __init__(self, exchange: Exchange, strategy: TradingStrategy):
+        """
+        :param exchange: Экземпляр подключения к бирже
+        :param strategy: Торговая стратегия
+        """
+        self.exchange = exchange
+        self.strategy = strategy
+        self.coin = strategy.coin
+        
+        self.logger = logging.getLogger("smart_bot")
+        self.logger.info(f"SmartBot initialized for {self.coin.symbol_id}")
+        
+        # Состояние бота
+        self.active_orders: Dict[str, Dict] = {}
+        self.position = Decimal('0')
+        self.running = False
+        self.task: Optional[asyncio.Task] = None
+        self.health_check_interval = 5  # секунды
+
+    async def start(self):
+        """Запуск торгового бота"""
+        if self.running:
+            self.logger.warning("Bot is already running")
+            return
+            
+        self.running = True
+        self.task = asyncio.create_task(self._trading_loop())
+        self.logger.info("SmartBot started")
+
+    async def stop(self):
+        """Остановка торгового бота"""
+        if not self.running:
+            return
+            
+        self.running = False
+        if self.task:
+            self.task.cancel()
+            try:
+                await self.task
+            except asyncio.CancelledError:
+                pass
+                
+        # Отмена всех активных ордеров при остановке
+        await self.exchange.cancel_all_orders(self.coin)
+        self.logger.info("SmartBot stopped")
+
+    async def _trading_loop(self):
+        """Основной торговый цикл"""
+        while self.running:
+            try:
+                # Проверка состояния биржи
+                if not await self._check_exchange_health():
+                    await asyncio.sleep(10)
+                    continue
+                
+                # Обновление позиции
+                await self._update_position()
+                
+                # Обновление активных ордеров
+                await self._update_active_orders()
+                
+                # Получение текущей цены
+                price = await self.exchange.get_symbol_price(self.coin)
+                
+                # Генерация торговых сигналов
+                signals = self.strategy.generate_signals(price, self.position)
+                
+                # Управление ордерами на основе сигналов
+                await self._manage_orders(signals)
+                
+                # Статус бота
+                self.logger.info(
+                    f"Active orders: {len(self.active_orders)} | "
+                    f"Position: {self.position} | "
+                    f"Price: {price}"
+                )
+                
+                # Интервал между проверками
+                await asyncio.sleep(self.health_check_interval)
+                
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self.logger.error(f"Trading loop error: {e}", exc_info=True)
+                await asyncio.sleep(10)
+
+    async def _check_exchange_health(self) -> bool:
+        """Проверка состояния биржевого подключения"""
+        status = await self.exchange.get_status_report()
+        
+        if status['needs_attention']:
+            self.logger.error(f"Exchange issue: {status['state']}")
+            return False
+            
+        if not status['is_operational']:
+            self.logger.warning(f"Exchange not operational: {status['state']}")
+            return False
+            
+        return True
+
+    async def _update_position(self):
+        """Обновление текущей позиции"""
+        # В реальной реализации здесь будет запрос к бирже
+        # Для примера просто сохраняем текущее значение
+        pass
+
+    async def _update_active_orders(self):
+        """Обновление информации об активных ордерах"""
+        # Здесь будет запрос к бирже для получения активных ордеров
+        # Для примера просто очищаем "исполненные" ордера
+        orders_to_remove = []
+        for order_id, order in self.active_orders.items():
+            # В реальной реализации здесь проверка статуса ордера
+            if order.get('status') == 'filled':
+                orders_to_remove.append(order_id)
+        
+        for order_id in orders_to_remove:
+            del self.active_orders[order_id]
+
+    async def _manage_orders(self, signals: Dict[str, Any]):
+        """Управление ордерами на основе торговых сигналов"""
+        # Отмена устаревших ордеров
+        await self._cancel_outdated_orders(signals)
+        
+        # Размещение новых ордеров
+        await self._place_new_orders(signals)
+
+    async def _cancel_outdated_orders(self, signals: Dict[str, Any]):
+        """Отмена ордеров, не соответствующих текущим сигналам"""
+        # В реальной реализации здесь будет сравнение текущих ордеров с сигналами
+        pass
+
+    async def _place_new_orders(self, signals: Dict[str, Any]):
+        """Размещение новых ордеров на основе сигналов"""
+        risk_params = self.strategy.get_risk_parameters()
+        max_orders = risk_params['max_orders']
+        order_size = risk_params['order_size']
+        
+        # Размещаем ордера на покупку
+        for price in signals['buy_levels']:
+            if len(self.active_orders) >= max_orders:
+                break
+                
+            if self._order_exists('buy', price):
+                continue
+                
+            await self._place_order('buy', price, order_size)
+
+        # Размещаем ордера на продажу
+        for price in signals['sell_levels']:
+            if len(self.active_orders) >= max_orders:
+                break
+                
+            if self._order_exists('sell', price):
+                continue
+                
+            await self._place_order('sell', price, order_size)
+
+    def _order_exists(self, side: str, price: Decimal) -> bool:
+        """Проверяет, существует ли уже активный ордер с такими параметрами"""
+        return any(
+            o['side'] == side and abs(o['price'] - price) < Decimal('0.00000001')
+            for o in self.active_orders.values()
+        )
+
+    async def _place_order(self, side: str, price: Decimal, size: Decimal):
+        """Размещение ордера на бирже"""
+        try:
+            order_id = await self.exchange.place_limit_order_by_size(
+                coin=self.coin,
+                side=side,
+                price=price,
+                size=size,
+                trade_mode="isolated"
+            )
+            
+            if order_id:
+                self.active_orders[order_id] = {
+                    'side': side,
+                    'price': price,
+                    'size': size,
+                    'status': 'active'
+                }
+                self.logger.info(f"Placed {side} order at {price}: {order_id}")
+            else:
+                self.logger.warning(f"Failed to place {side} order at {price}")
+        except Exception as e:
+            self.logger.error(f"Error placing {side} order: {e}")
+
+    async def get_status(self) -> Dict[str, any]:
+        """Возвращает текущее состояние бота"""
+        return {
+            'running': self.running,
+            'active_orders': len(self.active_orders),
+            'position': str(self.position),
+            'coin': self.coin.symbol_id,
+            'strategy': type(self.strategy).__name__
+        }

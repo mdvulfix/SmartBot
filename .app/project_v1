@@ -1,0 +1,1883 @@
+# === file: utils.py ===
+import logging
+
+from logging import Logger
+from logging.handlers import RotatingFileHandler
+
+class Utils:
+    @staticmethod
+    def get_logger(name) -> Logger:
+
+        logger = logging.getLogger(name)
+        logger.setLevel(logging.INFO)
+
+        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(name)s - %(message)s')
+        console_handler = logging.StreamHandler()
+        console_handler.setFormatter(formatter)
+        logger.addHandler(console_handler)
+
+        file_handler = RotatingFileHandler(f"{name}.log", maxBytes=5 * 1024 * 1024, backupCount=3)
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+        return logger
+    
+    def __new__(cls, *args, **kwargs):
+        raise TypeError("This class cannot be instantiated")
+
+# === file: exchange.py ===
+
+import hmac, hashlib, base64, json, asyncio, aiohttp, contextlib
+from enum import Enum, auto
+from abc import ABC, abstractmethod
+from decimal import Decimal, ROUND_DOWN
+from datetime import datetime, timezone
+from typing import Any, Tuple, Optional, List, Dict
+from aiohttp import ClientSession as Session, ClientTimeout as Timeout
+from utils import Utils
+from coin import Coin 
+
+class ExchangeState(Enum):
+    DISCONNECTED = auto()
+    CONNECTING = auto()
+    CONNECTED = auto()
+    ACTIVE = auto()
+    RATE_LIMITED = auto()
+    BALANCE_LOW = auto()
+    MAINTENANCE = auto()
+    API_ERROR = auto()
+    NETWORK_ERROR = auto()
+    ORDER_ERROR = auto()
+    UNKNOWN = auto()
+
+class Exchange(ABC):
+    @abstractmethod
+    async def _request(self, method: str, path: str, payload: Any = None) -> Tuple[Any, bool]:
+        pass
+
+    @abstractmethod
+    async def get_balance(self, coin: Coin) -> Optional[Decimal]:
+        pass
+
+    @abstractmethod
+    async def get_symbol_price(self, coin: Coin) -> Decimal:
+        pass
+
+    @abstractmethod
+    async def place_limit_order_by_size(self, coin: Coin, side: str, price: Decimal, size: Optional[Decimal], trade_mode: str) -> Optional[str]:
+        pass
+
+    @abstractmethod
+    async def place_limit_order_by_amount(self, coin: Coin, side: str, price: Decimal, notional: Optional[Decimal], trade_mode: str) -> Optional[str]:
+        pass
+
+    @abstractmethod
+    async def cancel_order(self, coin: Coin, order_id: str) -> bool:
+        pass
+
+    @abstractmethod
+    async def cancel_all_orders(self, coin: Coin) -> List[str]:
+        pass
+
+    @abstractmethod
+    async def close(self):
+        pass
+
+    @abstractmethod
+    async def run(self, interval: int, duration: int):
+        pass
+
+    @abstractmethod
+    async def stop(self):
+        pass
+
+    @abstractmethod
+    async def get_status_report(self) -> Dict[str, Any]:
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_):
+        await self.close()
+
+class OkxExchange(Exchange):
+    
+    CHECK_HEALTH_INTERVAL_SECONDS = 120  # seconds
+    RUN_DURATION_SECONDS = 5 * 60  # 5 minutes
+
+    def __init__(self, config: Any, demo: bool):
+        self._logger = Utils.get_logger("okx_exchange")
+
+        # load config
+        self._api_key = config["api_key"].strip()
+        self._secret_key = config["secret_key"].strip()
+        self._passphrase = config["passphrase"].strip()
+        
+
+        if not all([self._api_key, self._secret_key, self._passphrase]):
+            raise ValueError("Missing API credentials in okx_config.json")
+
+        self._base_url = "https://www.okx.com"
+        
+        # session
+        self._session: Optional[Session] = None
+
+        # state machine
+        self._state = ExchangeState.DISCONNECTED
+        self._state_history: List[Dict[str, Any]] = []
+        self._last_update: Optional[datetime] = None
+        self._critical_states = {
+            ExchangeState.API_ERROR,
+            ExchangeState.NETWORK_ERROR,
+            ExchangeState.ORDER_ERROR,
+            ExchangeState.MAINTENANCE,
+        }
+
+        # run/stop control
+        self._stop_event: Optional[asyncio.Event] = None
+        self._run_task: Optional[asyncio.Task] = None
+        self._closing = False  # Флаг закрытия
+
+        # log mode
+        self._demo = demo
+
+        if self._demo:
+            self._logger.info("Running in DEMO mode")
+        else:
+            self._logger.warning("Running in LIVE TRADING mode")
+
+        self._notifier = None
+        self._balance = Decimal("0")
+
+    # ----------------------------------------------------------------
+    # Run / Stop
+    # ----------------------------------------------------------------
+    async def run(self, interval: int = CHECK_HEALTH_INTERVAL_SECONDS, duration: int = RUN_DURATION_SECONDS):
+        if self._closing or (self._run_task and not self._run_task.done()):
+            self._logger.warning("Run loop already active or exchange is closing")
+            return
+
+        if self._stop_event is None:
+            self._stop_event = asyncio.Event()
+        else:
+            self._stop_event.clear()
+        
+        if not await self.connect():
+            self._logger.error("Run aborted: could not connect")
+            return
+
+        start = asyncio.get_event_loop().time()
+        self._logger.info(f"Run loop started: interval={interval}s, duration={duration}s")
+
+        async def _loop():
+            try:
+                while self._stop_event is not None and not self._stop_event.is_set() and (asyncio.get_event_loop().time() - start) < duration:
+                    if self._closing:
+                        break
+                    await self.check_health()
+                    await asyncio.sleep(interval)
+            except asyncio.CancelledError:
+                self._logger.info("Run loop cancelled")
+            finally:
+                if not self._closing:
+                    await self.close()
+                self._logger.info("Run loop finished")
+
+        self._run_task = asyncio.create_task(_loop())
+
+    async def stop(self):
+        if self._closing or not self._run_task or self._run_task.done():
+            return
+        self._logger.info("Stopping run loop")
+        if self._stop_event is not None:
+            self._stop_event.set()
+        self._run_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await self._run_task
+
+    # ----------------------------------------------------------------
+    # Connection / Health
+    # ----------------------------------------------------------------
+    async def connect(self) -> bool:
+        if self._closing:
+            return False
+            
+        self._update_state(ExchangeState.CONNECTING)
+        try:
+            if self._session and not self._session.closed:
+                await self._session.close()
+            self._session = Session(timeout=Timeout(total=10))
+
+            balance = await self.get_balance(Coin("USDT"))
+            self._balance = balance or Decimal("0")
+            self._update_state(ExchangeState.CONNECTED)
+            return True
+        except aiohttp.ClientConnectionError:
+            self._update_state(ExchangeState.NETWORK_ERROR)
+            return False
+        except Exception as e:
+            self._logger.error(f"Connection failed: {e}")
+            self._update_state(ExchangeState.API_ERROR)
+            return False
+
+    async def check_health(self):
+        try:
+            if self._closing:
+                return
+                
+            if self._state in {ExchangeState.DISCONNECTED, ExchangeState.NETWORK_ERROR}:
+                await self.connect()
+
+            balance = await self.get_balance(Coin("USDT"))
+            if balance is None:
+                self._update_state(ExchangeState.API_ERROR)
+                return
+            self._balance = balance
+
+            if self.balance < Decimal("10"):
+                self._update_state(ExchangeState.BALANCE_LOW)
+            else:
+                self._update_state(ExchangeState.ACTIVE)
+
+        except aiohttp.ClientConnectionError:
+            self._update_state(ExchangeState.NETWORK_ERROR)
+        except aiohttp.ClientResponseError as e:
+            if e.status == 429:
+                self._update_state(ExchangeState.RATE_LIMITED)
+            else:
+                self._update_state(ExchangeState.API_ERROR)
+        except Exception:
+            self._logger.exception("Health check failed")
+            self._update_state(ExchangeState.UNKNOWN)
+
+    async def close(self):
+        if self._closing:
+            return
+            
+        self._closing = True
+        
+        # Остановить фоновые задачи
+        await self.stop()
+        
+        # Закрыть сессию
+        if self._session and not self._session.closed:
+            await self._session.close()
+            self._logger.info("Session closed")
+        self._session = None
+        self._update_state(ExchangeState.DISCONNECTED)
+
+    # ----------------------------------------------------------------
+    # Core API
+    # ----------------------------------------------------------------
+    
+    async def get_balance(self, coin: Coin) -> Optional[Decimal]:
+        if self._closing:
+            return None
+            
+        data, ok = await self._request("GET", "/api/v5/account/balance")
+        if not ok or not isinstance(data, list) or not data:
+            self._logger.error("Invalid balance response")
+            return None
+
+        # Обрабатываем структуру ответа OKX
+        try:
+            for account in data:
+                details = account.get("details", [])
+                for detail in details:
+                    if detail.get("ccy") == coin.symbol:
+                        available_balance = detail.get("availBal", "0")
+                        return Decimal(available_balance)
+        except Exception as e:
+            self._logger.error(f"Error parsing balance: {e}")
+        
+        self._logger.warning(f"Currency {coin.symbol} not found in balance data")
+        return Decimal("0")
+
+    async def get_symbol_price(self, coin: Coin) -> Decimal:
+        if self._closing:
+            return Decimal("0")
+            
+        data, ok = await self._request("GET", "/api/v5/market/ticker", {"instId": coin.symbol_id})
+        if not ok or not data or not isinstance(data, list):
+            self._logger.error(f"Invalid ticker response for {coin.symbol}")
+            return Decimal("0")
+        
+        try:
+            last_price = data[0].get("last")
+            return Decimal(last_price) if last_price else Decimal("0")
+        except Exception as e:
+            self._logger.error(f"Error parsing price for {coin.symbol}: {e}")
+            return Decimal("0")
+
+    async def get_symbol_details(self, coin: Coin) -> Dict[str, Any]:
+        """Получает и кэширует параметры инструмента"""
+        if self._closing:
+            return {
+                "minSz": Decimal("0.01"),
+                "lotSz": Decimal("0.01"),
+                "tickSz": Decimal("0.01"),
+                "ctVal": Decimal("1"),
+                "ctType": "linear"
+            }
+            
+        symbol = coin.symbol
+        
+        if symbol in Coin.SYMBOL_CACHE:
+            return Coin.SYMBOL_CACHE[symbol]
+
+        # Определяем тип инструмента по символу
+        symbol_type = "SWAP"
+        data, ok = await self._request("GET", "/api/v5/public/instruments", {"instType": symbol_type, "instId": coin.symbol_id})
+        
+        if not ok or not data or not isinstance(data, list):
+            self._logger.error(f"Failed to get instrument details for {symbol}")
+            return {
+                "minSz": Decimal("0.01"),
+                "lotSz": Decimal("0.01"),
+                "tickSz": Decimal("0.01"),
+                "ctVal": Decimal("1"),
+                "ctType": "linear"
+            }
+
+        try:
+            symbol_data = data[0]
+            symbol_details = {
+                "minSz": Decimal(symbol_data.get("minSz", "0.01")),
+                "lotSz": Decimal(symbol_data.get("lotSz", "0.01")),
+                "tickSz": Decimal(symbol_data.get("tickSz", "0.01")),
+                "ctVal": Decimal(symbol_data.get("ctVal", "1")),
+                "ctType": symbol_data.get("ctType", "linear")
+            }
+            Coin.SYMBOL_CACHE[symbol] = symbol_details
+            return symbol_details
+        
+        except Exception as e:
+            self._logger.error(f"Error parsing instrument details: {e}")
+            return {
+                "minSz": Decimal("0.01"),
+                "lotSz": Decimal("0.01"),
+                "tickSz": Decimal("0.01"),
+                "ctVal": Decimal("1"),
+                "ctType": "linear"
+            }
+        
+    async def place_limit_order_by_size(self, coin: Coin, side: str, price: Decimal, size: Optional[Decimal], trade_mode: str = "isolated") -> Optional[str]:
+        if self._closing:
+            return None
+
+        details = await self.get_symbol_details(coin)
+        min_size = details["minSz"]
+        lot_size = details["lotSz"]
+        tick_size = details["tickSz"]
+
+        if size is None:
+            self._logger.error("Size must be specified")
+            return None
+        
+        # Корректировка минимального размера
+        size = (size // lot_size) * lot_size
+        if size < min_size:
+            self._logger.info(f"Size adjusted to minimum: {size} -> {min_size}")
+            size = min_size
+
+        # Корректировка цены
+        price = (price // tick_size) * tick_size
+
+        # Формирование запроса
+        order = {
+            "instId": coin.symbol_id,
+            "tdMode": trade_mode,
+            "side": side.lower(),
+            "ordType": "limit",
+            "px": str(price),
+            "sz": str(size),
+        }
+
+        self._logger.info(f"Placing order: {coin.symbol} {side} {price} {size}")
+
+        data, ok = await self._request("POST", "/api/v5/trade/order", order)
+        if ok and data and isinstance(data, list):
+            order_id = data[0].get("ordId")
+            if order_id:
+                self._logger.info(f"Order placed: {order_id}")
+                return order_id
+
+        self._logger.error(f"Order failed: {data}")
+        return None
+
+    async def place_limit_order_by_amount(self, coin: Coin, side: str, price: Decimal, notional: Optional[Decimal], trade_mode: str = "isolated") -> Optional[str]:
+        if self._closing:
+            return None
+
+        details = await self.get_symbol_details(coin)
+        min_size = details["minSz"]
+        lot_size = details["lotSz"]
+        tick_size = details["tickSz"]
+        ctVal = details["ctVal"]
+        ctType = details["ctType"]
+
+        if notional is None:
+            self._logger.error("Notional must be specified")
+            return None
+            
+        if ctType == "inverse":
+            self._logger.error("Notional calculation not supported for inverse contracts")
+            return None
+        
+        # Расчет размера по номиналу    
+        size = notional / (price * ctVal)
+            
+        # Корректировка размера и цены
+        size = (size // lot_size) * lot_size
+        
+        price = (price // tick_size) * tick_size
+        if price <= 0:
+            self._logger.error("Invalid price")
+            return None
+
+        # Формирование запроса
+        order = {
+            "instId": coin.symbol_id,
+            "tdMode": trade_mode,
+            "side": side.lower(),
+            "ordType": "limit",
+            "px": str(price),
+            "sz": str(size),
+        }
+
+        self._logger.info(f"Placing order: {coin.symbol} {side} {price} {size}")
+
+        data, ok = await self._request("POST", "/api/v5/trade/order", order)
+        if ok and data and isinstance(data, list):
+            order_id = data[0].get("ordId")
+            if order_id:
+                self._logger.info(f"Order placed: {order_id}")
+                return order_id
+
+        self._logger.error(f"Order failed: {data}")
+        return None
+
+    async def cancel_order(self, coin: Coin, order_id: str) -> bool:
+        if self._closing:
+            return False
+            
+        order = {"instId": coin.symbol_id, "ordId": order_id}
+        data, ok = await self._request("POST", "/api/v5/trade/cancel-order", order)
+
+        if ok:
+            self._logger.info(f"Order cancelled: {order_id}")
+            return True
+        
+        self._logger.error(f"Cancel failed: {data}")
+        return False
+        
+    async def cancel_all_orders(self, coin: Coin) -> List[str]:
+        if self._closing:
+            return []
+            
+        # Получаем активные ордера
+        data, ok = await self._request("GET", "/api/v5/trade/orders-pending", {"instId": coin.symbol_id})
+        if not ok or not data:
+            return []
+
+        # Формируем список ордеров для отмены
+        orders_to_cancel = [{"instId": coin.symbol_id, "ordId": order["ordId"]} for order in data]
+        
+        if not orders_to_cancel:
+            return []
+
+        # Отменяем пачкой
+        cancel_data, ok = await self._request("POST", "/api/v5/trade/cancel-batch-orders", orders_to_cancel)
+        if not ok:
+            return []
+
+        # Собираем успешно отмененные ордера
+        canceled = [item["ordId"] for item in cancel_data if item.get("sCode") == "0"]
+        self._logger.info(f"Canceled {len(canceled)} orders")
+        return canceled
+
+    async def get_status_report(self) -> Dict[str, Any]:
+        return {
+            "state": self._state.name,
+            "last_update": self._last_update.isoformat() if self._last_update else None,
+            "balance": str(self._balance),
+            "is_operational": self._state in {
+                ExchangeState.ACTIVE,
+                ExchangeState.CONNECTED,
+                ExchangeState.BALANCE_LOW,
+            },
+            "needs_attention": self._state in self._critical_states,
+            "state_history": self._get_recent_history(),
+        }
+
+    async def _request(self, method: str, path: str, payload: Any = None) -> Tuple[Any, bool]:
+        if self._closing:
+            self._logger.warning("Skipping request, exchange is closing")
+            return [], False
+            
+        if not self._session or self._session.closed:
+            self._session = Session(timeout = Timeout(total = 10))
+
+        url = self._base_url + path
+
+        # Prepare query parameters for GET requests
+        if method.upper() == "GET" and payload:
+            # Сортируем параметры и кодируем их
+            sorted_params = sorted(payload.items(), key=lambda x: x[0])
+            encoded_params = "&".join(f"{k}={v}" for k, v in sorted_params)
+            full_url = f"{url}?{encoded_params}"
+            body = ""
+        else:
+            full_url = url
+            body = json.dumps(payload, separators=(",", ":")) if payload else ""
+            encoded_params = ""
+
+        # Для подписи используем полный путь с параметрами для GET
+        sign_path = f"{path}?{encoded_params}" if method.upper() == "GET" and payload else path
+
+        # Генерируем timestamp в правильном формате
+        now = datetime.now(timezone.utc)
+        timestamp = now.strftime('%Y-%m-%dT%H:%M:%S') + f".{now.microsecond // 1000:03d}Z"
+        
+        # Формируем сообщение для подписи
+        message = f"{timestamp}{method.upper()}{sign_path}{body}"
+        self._logger.debug(f"Signing message: {message}")
+        
+        # Создаем подпись
+        signature = base64.b64encode(
+            hmac.new(
+                self._secret_key.encode('utf-8'),
+                message.encode('utf-8'),
+                hashlib.sha256
+            ).digest()
+        ).decode('utf-8')
+
+        headers = {
+            "OK-ACCESS-KEY": self._api_key,
+            "OK-ACCESS-SIGN": signature,
+            "OK-ACCESS-TIMESTAMP": timestamp,
+            "OK-ACCESS-PASSPHRASE": self._passphrase,
+            "Content-Type": "application/json",
+            **({"x-simulated-trading": "1"} if self._demo else {}),
+        }
+        if body:
+            headers["Content-Length"] = str(len(body))
+
+        for attempt in range(1, 4):
+            try:
+                request_params = {
+                    "method": method,
+                    "url": full_url,
+                    "headers": headers,
+                    "timeout": Timeout(total=10)
+                }
+
+                if method.upper() == "POST" and body:
+                    request_params["data"] = body
+                elif method.upper() == "GET" and payload:
+                    # Для GET параметры уже в URL
+                    pass
+                else:
+                    request_params["json"] = payload if payload else None
+
+                async with self._session.request(**request_params) as resp:
+                    data = await resp.json()
+                    self._logger.debug(f"Response: {data}")
+
+                    if resp.status in {429, 502, 503}:
+                        retry_after = int(resp.headers.get("Retry-After", 2 ** attempt))
+                        self._logger.warning(f"Retryable {resp.status}, waiting {retry_after}s")
+                        await asyncio.sleep(retry_after)
+                        continue
+
+                    ok = (resp.status == 200 and data.get("code") == "0")
+                    if not ok:
+                        self._logger.error(f"API error {resp.status}: {data.get('code')} – {data.get('msg')}")
+                    return data.get("data", []), ok
+
+            except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+                self._logger.error(f"Network error [{method} {path}] attempt {attempt}: {e}")
+                await asyncio.sleep(2 ** attempt)
+            except Exception as e:
+                self._logger.exception(f"Unexpected error: {e}")
+                return [], False
+
+        self._logger.error(f"Failed after 3 attempts: {method} {path}")
+        return [], False  
+    
+    # ----------------------------------------------------------------
+    # Helpers
+    # ----------------------------------------------------------------
+    
+    def _update_state(self, new_state: ExchangeState):
+        if self._state != new_state:
+            now = datetime.now(datetime.timezone.utc)
+            self._state_history.append({
+                "timestamp": now,
+                "from": self._state.name,
+                "to": new_state.name,
+            })
+            self._state = new_state
+            self._last_update = now
+            self._logger.info(f"State changed: {self._state.name}")
+            if new_state in self._critical_states and self._notifier:
+                asyncio.create_task(self._notifier.send_alert(f"State changed to {self._state.name}"))
+
+    def _get_recent_history(self, count: int = 5) -> List[Dict[str, str]]:
+        return [
+            {"timestamp": h["timestamp"].isoformat(), "from": h["from"], "to": h["to"]}
+            for h in self._state_history[-count:]
+        ]
+    
+# === file: bot.py ===
+
+import asyncio
+import random
+from typing import Any, Dict, Optional
+from decimal import Decimal
+from utils import Utils
+from exchange import Exchange
+from strategy import Strategy
+from order import Order, OrderManager
+from position import Position, PositionManager
+
+class SmartBot:
+    
+    def __init__(self, exchange: Exchange, strategy: Strategy):
+                        
+        self._exchange = exchange
+        self._strategy = strategy
+        self._coin = strategy.coin
+        
+        self._logger = Utils.get_logger("SmartBot")
+        self._logger.info(f"SmartBot initialized for {self._coin.symbol_id}")
+        
+        # Менеджеры состояний
+        self._order_manager = OrderManager()
+        self._position_manager = PositionManager()
+        
+        # Текущая позиция
+        self._current_position: Optional[Position] = None
+
+        # Состояние бота
+        self._running = False
+        self._task: Optional[asyncio.Task] = None
+
+        # Проверка состояния биржи
+        self._helth_check_interval = 30
+
+    async def start(self):
+        if self._running:
+            self._logger.warning("Bot is already running")
+            return
+            
+        self._running = True
+        self._task = asyncio.create_task(self._trading_loop())
+        self._logger.info("SmartBot started")
+
+    async def stop(self):
+        """Остановка торгового бота"""
+        if not self.running:
+            return
+            
+        self.running = False
+        if self.task:
+            self.task.cancel()
+            try:
+                await self.task
+            except asyncio.CancelledError:
+                pass
+                
+        # Отмена всех активных ордеров при остановке
+        for order in self.order_manager.get_active_orders():
+            await self.exchange.cancel_order(self.coin, order.id)
+            self.order_manager.close_order(
+                order_id=order.id,
+                reason="bot_stopped"
+            )
+        
+        self.logger.info("SmartBot stopped")
+
+    async def get_status(self) -> Dict[str, any]:
+        """Возвращает текущее состояние бота"""
+        return {
+            'running': self._running,
+            'active_orders': len(self._active_orders),
+            'position': str(self._position),
+            'coin': self._coin.symbol_id,
+            'strategy': type(self._strategy).__name__
+        }
+
+    def get_position_report(self) -> Dict[str, Any]:
+        """Отчет по текущей позиции"""
+        if not self.current_position:
+            return {"status": "no_open_position"}
+        
+        report = self.current_position.to_dict()
+        report['orders'] = [self.order_manager.get_order(oid).to_dict() for oid in self.current_position.orders]
+        return report
+
+    def get_strategy_performance(self) -> Dict[str, Any]:
+        """Расширенный отчет по производительности стратегии"""
+        strategy_name = type(self.strategy).__name__
+        
+        return {
+            "strategy": strategy_name,
+            "coin": self.coin.symbol_id,
+            "order_performance": self.order_manager.calculate_strategy_performance(strategy_name),
+            "position_performance": self.position_manager.calculate_strategy_performance(strategy_name),
+            "current_position": self.get_position_report() if self.current_position else None
+        }
+
+    async def _trading_loop(self):
+
+        while self._running:
+            try:
+                # Проверка состояния биржи
+                if not await self._check_exchange_health():
+                    await asyncio.sleep(10)
+                    continue
+                
+                # Обновление позиции
+                await self._update_position()
+                
+                # Обновление активных ордеров
+                await self._update_active_orders()
+                
+                # Получение текущей цены
+                price = await self._exchange.get_symbol_price(self._coin)
+                
+                # Генерация торговых сигналов
+                signals = self._strategy.generate_signals(price, self._position)
+                
+                # Управление ордерами на основе сигналов
+                await self._manage_orders(signals)
+                
+                # Статус бота
+                self._logger.info(f"Active orders: {len(self._active_orders)} | " f"Position: {self._position} | " f"Price: {price}")
+                
+                # Интервал между проверками
+                await asyncio.sleep(self._helth_check_interval)
+                
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self._logger.error(f"Trading loop error: {e}", exc_info=True)
+                await asyncio.sleep(10)
+
+    async def _check_exchange_health(self) -> bool:
+        status = await self._exchange.get_status_report()
+        
+        if status['needs_attention']:
+            self._logger.error(f"Exchange issue: {status['state']}")
+            return False
+            
+        if not status['is_operational']:
+            self._logger.warning(f"Exchange not operational: {status['state']}")
+            return False
+            
+        return True
+
+    async def _update_position(self):
+        """Обновляет информацию о позиции"""
+        # Получаем текущий баланс по монете
+        balance = await self.exchange.get_balance(self.coin)
+        
+        # Если позиция существует и размер изменился
+        if self.current_position and self.current_position.status == PositionStatus.OPEN:
+            if abs(self.current_position.current_size - balance) > Decimal('0.0001'):
+                # Позиция изменилась - обновляем
+                self.current_position.current_size = balance
+                self.current_position.update_price(await self.exchange.get_symbol_price(self.coin))
+
+    async def _update_active_orders(self):
+        """Обновление информации об активных ордерах и позициях"""
+        # Здесь будет запрос к бирже для получения обновлений по ордерам
+        for order in self.order_manager.get_active_orders():
+            # Эмуляция: 50% шанс, что ордер исполнился
+            if random.random() > 0.5:
+                filled_size = order.size
+                filled_price = order.price
+                fee = order.size * order.price * Decimal('0.0002')
+                
+                # Обновляем ордер
+                self.order_manager.update_order_fill(
+                    order_id=order.id,
+                    filled_size=filled_size,
+                    filled_price=filled_price,
+                    fee=fee,
+                    fee_currency="USDT"
+                )
+                
+                # Обновляем позицию
+                position = self.position_manager.get_position_for_order(order.id)
+                if position:
+                    position.update_price(await self.exchange.get_symbol_price(self.coin))
+                    
+                    # Если позиция закрыта
+                    if position.status == PositionStatus.CLOSED:
+                        self.current_position = None
+
+    async def _manage_orders(self, signals: Dict[str, Any]):
+        """Управление ордерами на основе торговых сигналов"""
+        # Отмена устаревших ордеров
+        await self._cancel_outdated_orders(signals)
+        
+        # Размещение новых ордеров
+        await self._place_new_orders(signals)
+
+    async def _cancel_outdated_orders(self, signals: Dict[str, Any]):
+        """Отмена ордеров, не соответствующих текущим сигналам"""
+        for order in self.order_manager.get_active_orders():
+            if self._should_cancel_order(order, signals):
+                success = await self.exchange.cancel_order(self.coin, order.id)
+                if success:
+                    self.order_manager.close_order(
+                        order_id=order.id,
+                        reason="outdated_signal"
+                    )
+
+    async def _place_new_orders(self, signals: Dict[str, Any]):
+        """Размещение новых ордеров на основе сигналов"""
+        risk_params = self._strategy.get_risk_parameters()
+        max_orders = risk_params['max_orders']
+        order_size = risk_params['order_size']
+        
+        # Размещаем ордера на покупку
+        for price in signals['buy_levels']:
+            if len(self._active_orders) >= max_orders:
+                break
+                
+            if self._order_exists('buy', price):
+                continue
+                
+            await self._place_order('buy', price, order_size)
+
+        # Размещаем ордера на продажу
+        for price in signals['sell_levels']:
+            if len(self._active_orders) >= max_orders:
+                break
+                
+            if self._order_exists('sell', price):
+                continue
+                
+            await self._place_order('sell', price, order_size)
+
+    async def _place_order(self, side: str, price: Decimal, size: Decimal):
+        """Размещение ордера и обновление позиции"""
+        try:
+            order_id = await self.exchange.place_limit_order_by_size(
+                coin=self.coin,
+                side=side,
+                price=price,
+                size=size,
+                trade_mode="isolated"
+            )
+            
+            if order_id:
+                # Создаем объект ордера
+                order = Order(
+                    order_id=order_id,
+                    side=side,
+                    price=price,
+                    size=size,
+                    coin=self.coin.symbol_id,
+                    strategy=type(self.strategy).__name__
+                )
+                
+                # Добавляем в менеджер ордеров
+                self.order_manager.add_order(order)
+                
+                # Связываем с позицией
+                if not self.current_position or self.current_position.status != PositionStatus.OPEN:
+                    self.current_position = self.position_manager.open_position(
+                        coin=self.coin.symbol_id,
+                        strategy=type(self.strategy).__name__,
+                        size=size if side == 'buy' else -size,
+                        price=price
+                    )
+                
+                # Добавляем комиссию (эмуляция, в реальности получаем с биржи)
+                fee = size * price * Decimal('0.0002')  # 0.02% комиссия
+                
+                # Добавляем ордер к позиции
+                self.position_manager.add_order_to_position(
+                    position_id=self.current_position.id,
+                    order_id=order_id,
+                    side=side,
+                    size=size,
+                    price=price,
+                    fee=fee
+                )
+                
+                self.logger.info(f"Placed {side} order at {price}: {order_id}")
+                return order_id
+            else:
+                self.logger.warning(f"Failed to place {side} order at {price}")
+        except Exception as e:
+            self.logger.error(f"Error placing {side} order: {e}")
+        return None
+
+
+    def _order_exists(self, side: str, price: Decimal) -> bool:
+        return any(o['side'] == side and abs(o['price'] - price) < Decimal('0.00000001') for o in self._active_orders.values())
+    
+    def _should_cancel_order(self, order: Order, signals: Dict) -> bool:
+        """Определяет, нужно ли отменить ордер"""
+        # Логика определения устаревших ордеров
+        if order.side == 'buy' and order.price not in signals['buy_levels']:
+            return True
+        if order.side == 'sell' and order.price not in signals['sell_levels']:
+            return True
+        return False
+    
+# === file: coin.py ===
+from dataclasses import dataclass
+from typing import Any, Tuple, Optional, List, Dict
+from decimal import Decimal
+
+class Coin:
+    
+    # Symbol cache for min lot size
+    SYMBOL_CACHE: Dict[str, Dict[str, Any]] = {}
+    # Symbol precision cache
+    SYMBOL_PRECISION_CACHE: Dict[str, Tuple[int, int]] = {}
+    
+    def __init__(self, symbol: str):
+        self._symbol: str = symbol.upper()
+
+    @property
+    def symbol_id(self) -> str:
+        if self._symbol == "USDT":
+            return "USDT"
+        else:
+            return f"{self._symbol}-USDT-SWAP"
+    
+    @property
+    def symbol(self) -> str:
+        return self._symbol
+
+    @property
+    def symbol_min_lot_size(self) -> Decimal:
+        return Decimal("0.00")
+    
+    @property
+    def symbol_precision(self) -> int:
+        return 0
+    
+# === file: strategy.py ===
+
+import asyncio
+import logging
+from decimal import Decimal
+from typing import Dict, List, Optional, Any
+from exchange import Exchange, Coin
+from abc import ABC, abstractmethod
+
+class Strategy(ABC):
+    """Абстрактный класс торговой стратегии"""
+    @abstractmethod
+    def generate_signals(self, price: Decimal, position: Decimal) -> Dict[str, Any]:
+        pass
+    
+    @abstractmethod
+    def get_risk_parameters(self) -> Dict[str, Any]:
+        pass
+    
+    @abstractmethod
+    def update_market_data(self, data: Dict[str, Any]):
+        pass
+    
+    @abstractmethod
+    def should_cancel_order(self, order: Dict, current_signals: Dict) -> bool:
+        """Должна ли стратегия отменить этот ордер?"""
+        pass
+
+class GridStrategy(Strategy):
+    """Стратегия Grid Trading"""
+    def __init__(
+        self,
+        coin: Coin,
+        lower_bound: Decimal,
+        upper_bound: Decimal,
+        grid_levels: int,
+        order_size: Decimal,
+        max_orders: int = 10,
+        position_size: Decimal = Decimal('0'),
+        grid_spacing: str = 'arithmetic'
+    ):
+        self.coin = coin
+        self.lower_bound = lower_bound
+        self.upper_bound = upper_bound
+        self.grid_levels = grid_levels
+        self.order_size = order_size
+        self.max_orders = max_orders
+        self.position_size = position_size
+        self.grid_spacing = grid_spacing
+        
+        self.grid_prices: List[Decimal] = []
+        self._generate_grid_prices()
+        
+        self.logger = logging.getLogger("grid_strategy")
+        self.logger.info(f"GridStrategy initialized for {coin.symbol_id}")
+
+    def _generate_grid_prices(self):
+        """Генерация ценовых уровней сетки"""
+        self.grid_prices = []
+        
+        if self.grid_spacing == 'geometric':
+            ratio = (self.upper_bound / self.lower_bound) ** (1 / (self.grid_levels - 1))
+            for i in range(self.grid_levels):
+                price = self.lower_bound * (ratio ** i)
+                self.grid_prices.append(price)
+        else:
+            step = (self.upper_bound - self.lower_bound) / (self.grid_levels - 1)
+            for i in range(self.grid_levels):
+                price = self.lower_bound + (step * i)
+                self.grid_prices.append(price)
+        
+        # Округляем до 8 знаков для криптовалют
+        self.grid_prices = [p.quantize(Decimal('0.00000000')) for p in self.grid_prices]
+
+    def generate_signals(self, price: Decimal, position: Decimal) -> Dict[str, Any]:
+        """Генерация торговых сигналов на основе сетки"""
+        buy_levels = [p for p in self.grid_prices if p < price]
+        sell_levels = [p for p in self.grid_prices if p > price]
+        
+        return {
+            'buy_levels': buy_levels[-self.max_orders:],
+            'sell_levels': sell_levels[:self.max_orders],
+            'current_price': price,
+            'position': position
+        }
+
+    def get_risk_parameters(self) -> Dict[str, Any]:
+        """Возвращает параметры управления рисками"""
+        return {
+            'order_size': self.order_size,
+            'max_orders': self.max_orders,
+            'position_size': self.position_size
+        }
+
+    def update_market_data(self, data: Dict[str, Any]):
+        """Обновление рыночных данных (для адаптивных стратегий)"""
+        # Для базовой grid-стратегии не требуется адаптация
+        pass
+
+    def update_grid(self, lower: Decimal, upper: Decimal, levels: int):
+        """Обновление параметров сетки"""
+        self.lower_bound = lower
+        self.upper_bound = upper
+        self.grid_levels = levels
+        self._generate_grid_prices()
+        self.logger.info("Grid parameters updated")
+
+class MeanReversionStrategy(Strategy):
+    """Стратегия торговли по возврату к среднему"""
+    def __init__(self, coin: Coin, window: int, std_dev: Decimal, order_size: Decimal):
+        self.coin = coin
+        self.window = window  # Период для расчета SMA
+        self.std_dev = std_dev  # Количество стандартных отклонений
+        self.order_size = order_size
+        self.prices: List[Decimal] = []
+        
+    def update_market_data(self, data: Dict[str, Any]):
+        """Обновление рыночных данных"""
+        self.prices.append(data['price'])
+        if len(self.prices) > self.window:
+            self.prices.pop(0)
+    
+    def generate_signals(self, price: Decimal, position: Decimal) -> Dict[str, Any]:
+        """Генерация сигналов на основе отклонения от среднего"""
+        if len(self.prices) < self.window:
+            return {'buy': False, 'sell': False}
+        
+        # Расчет SMA и стандартного отклонения
+        sma = sum(self.prices) / len(self.prices)
+        variance = sum((x - sma) ** 2 for x in self.prices) / len(self.prices)
+        std = variance.sqrt()
+        
+        # Генерация сигналов
+        buy_signal = price < sma - self.std_dev * std
+        sell_signal = price > sma + self.std_dev * std
+        
+        return {
+            'buy': buy_signal,
+            'sell': sell_signal,
+            'sma': sma,
+            'std': std
+        }
+    
+    def get_risk_parameters(self) -> Dict[str, Any]:
+        return {'order_size': self.order_size}
+
+class AdaptiveGridStrategy(GridStrategy):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.performance_history = []
+        self.adjustment_threshold = Decimal('0.05')  # 5% убытков
+        
+    def update_performance(self, performance: Dict[str, Any]):
+        """Обновление параметров на основе производительности"""
+        self.performance_history.append(performance)
+        
+        # Анализируем последние 10 сделок
+        recent_trades = self.performance_history[-10:]
+        if len(recent_trades) < 5:
+            return
+            
+        total_profit = sum(Decimal(p['total_profit']) for p in recent_trades)
+        
+        # Если убыток превышает порог - адаптируем сетку
+        if total_profit < 0 and abs(total_profit) > self.adjustment_threshold:
+            self._adjust_grid_parameters()
+            
+    def _adjust_grid_parameters(self):
+        """Адаптация параметров сетки"""
+        # Увеличиваем диапазон при убытках
+        price_range = self.upper_bound - self.lower_bound
+        new_lower = self.lower_bound - price_range * Decimal('0.1')
+        new_upper = self.upper_bound + price_range * Decimal('0.1')
+        
+        # Увеличиваем количество уровней
+        new_levels = min(self.grid_levels + 2, 50)
+        
+        self.update_grid(new_lower, new_upper, new_levels)
+        self.logger.info(f"Adjusted grid to {new_lower}-{new_upper} with {new_levels} levels")
+
+class RiskAwareGridStrategy(GridStrategy):
+    def __init__(self, *args, max_drawdown=Decimal('0.05'), **kwargs):
+        super().__init__(*args, **kwargs)
+        self.max_drawdown = max_drawdown  # 5% макс просадка
+        
+    def generate_signals(self, price: Decimal, position: Position) -> Dict[str, Any]:
+        signals = super().generate_signals(price, position.current_size if position else Decimal('0'))
+        
+        # Анализ риска текущей позиции
+        if position and position.status == PositionStatus.OPEN:
+            # Рассчитываем просадку относительно максимальной прибыли
+            current_drawdown = position.max_profit - (position.realized_pnl + position.unrealized_pnl)
+            drawdown_percent = current_drawdown / position.entry_price / position.current_size
+            
+            # Если просадка превышает лимит - генерируем сигнал на снижение риска
+            if drawdown_percent > self.max_drawdown:
+                signals['risk_reduction'] = True
+                # Добавляем дополнительные уровни продажи
+                signals['sell_levels'] = signals['sell_levels'][:2]  # Оставляем только ближайшие уровни
+            else:
+                signals['risk_reduction'] = False
+        
+        return signals
+    
+# === file: order.py ===
+
+from decimal import Decimal
+from datetime import datetime
+from enum import Enum
+from typing import Optional, Dict, Any
+
+class OrderStatus(Enum):
+    ACTIVE = "active"
+    FILLED = "filled"
+    PARTIALLY_FILLED = "partially_filled"
+    CANCELED = "canceled"
+    REJECTED = "rejected"
+    EXPIRED = "expired"
+
+class Order:
+    def __init__(self, order_id: str, side: str, price: Decimal, size: Decimal, coin: str, strategy: str, created_at: Optional[datetime] = None):
+        self._id = order_id
+        self._side = side
+        self.price = price
+        self.size = size
+        self.coin = coin
+        
+        self.strategy = strategy
+        self.created_at = created_at or datetime.now(datetime.timezone.utc)
+        self.updated_at = self.created_at
+        self.status = OrderStatus.ACTIVE
+        self.filled_at: Optional[datetime] = None
+        self.filled_price: Optional[Decimal] = None
+        self.filled_size: Decimal = Decimal('0')
+        self.fee: Decimal = Decimal('0')
+        self.fee_currency: Optional[str] = None
+        self.profit: Optional[Decimal] = None
+        self.close_reason: Optional[str] = None
+
+    def update_fill(self, filled_size: Decimal, filled_price: Decimal, fee: Decimal, fee_currency: str, status: OrderStatus):
+        self.status = status
+        self.updated_at = datetime.now(datetime.timezone.utc)
+        self.filled_size = filled_size
+        self.filled_price = filled_price
+        self.fee = fee
+        self.fee_currency = fee_currency
+        
+        if status == OrderStatus.FILLED:
+            self.filled_at = self.updated_at
+
+    def calculate_profit(self, exit_price: Optional[Decimal] = None):
+        if self._side == 'buy' and exit_price:
+            self.profit = (exit_price - self.filled_price) * self.filled_size - self.fee
+        return self.profit
+
+    def close(self, reason: str, status: OrderStatus = OrderStatus.CANCELED):
+        self.status = status
+        self.updated_at = datetime.now(datetime.timezone.utc)
+        self.close_reason = reason
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self._id,
+            "side": self._side,
+            "price": str(self.price),
+            "size": str(self.size),
+            "coin": self.coin,
+            "strategy": self.strategy,
+            "status": self.status.value,
+            "created_at": self.created_at.isoformat(),
+            "updated_at": self.updated_at.isoformat(),
+            "filled_at": self.filled_at.isoformat() if self.filled_at else None,
+            "filled_price": str(self.filled_price) if self.filled_price else None,
+            "filled_size": str(self.filled_size),
+            "fee": str(self.fee),
+            "fee_currency": self.fee_currency,
+            "profit": str(self.profit) if self.profit is not None else None,
+            "close_reason": self.close_reason
+        }
+    
+from collections import defaultdict
+from typing import Dict, List, Optional, Tuple
+
+class OrderManager:
+    def __init__(self):
+        self.active_orders: Dict[str, Order] = {}
+        self.closed_orders: Dict[str, Order] = {}
+        self.orders_by_strategy = defaultdict(list)
+        self.orders_by_coin = defaultdict(list)
+
+    def add_order(self, order: Order):
+        self.active_orders[order._id] = order
+        self.orders_by_strategy[order.strategy].append(order._id)
+        self.orders_by_coin[order.coin].append(order._id)
+
+    def update_order_fill(self, order_id: str, filled_size: Decimal, filled_price: Decimal, fee: Decimal, fee_currency: str, status: OrderStatus = OrderStatus.FILLED):
+        if order_id in self.active_orders:
+            order = self.active_orders[order_id]
+            order.update_fill(filled_size, filled_price, fee, fee_currency,status)
+            
+            if status in {OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED}:
+                # Для частичного исполнения ордер остается активным
+                if status == OrderStatus.FILLED:
+                    self._move_to_closed(order_id)
+            else:
+                self._move_to_closed(order_id)
+
+    def close_order(self, order_id: str, reason: str, status: OrderStatus = OrderStatus.CANCELED):
+        if order_id in self.active_orders:
+            order = self.active_orders[order_id]
+            order.close(reason, status)
+            self._move_to_closed(order_id)
+
+    def _move_to_closed(self, order_id: str):
+        if order_id in self.active_orders:
+            order = self.active_orders.pop(order_id)
+            self.closed_orders[order_id] = order
+
+    def get_order(self, order_id: str) -> Optional[Order]:
+        if order_id in self.active_orders:
+            return self.active_orders[order_id]
+        return self.closed_orders.get(order_id)
+
+    def get_active_orders(self) -> List[Order]:
+        return list(self.active_orders.values())
+
+    def get_closed_orders(self) -> List[Order]:
+        return list(self.closed_orders.values())
+
+    def get_orders_by_strategy(self, strategy: str) -> Tuple[List[Order], List[Order]]:
+        active = []
+        closed = []
+        for order_id in self.orders_by_strategy.get(strategy, []):
+            if order_id in self.active_orders:
+                active.append(self.active_orders[order_id])
+            elif order_id in self.closed_orders:
+                closed.append(self.closed_orders[order_id])
+        return active, closed
+
+    def get_orders_by_coin(self, coin: str) -> Tuple[List[Order], List[Order]]:
+        active = []
+        closed = []
+        for order_id in self.orders_by_coin.get(coin, []):
+            if order_id in self.active_orders:
+                active.append(self.active_orders[order_id])
+            elif order_id in self.closed_orders:
+                closed.append(self.closed_orders[order_id])
+        return active, closed
+
+    def calculate_strategy_performance(self, strategy: str) -> Dict[str, Any]:
+        _, closed_orders = self.get_orders_by_strategy(strategy)
+        return self._analyze_orders(closed_orders)
+
+    def calculate_coin_performance(self, coin: str) -> Dict[str, Any]:
+        _, closed_orders = self.get_orders_by_coin(coin)
+        return self._analyze_orders(closed_orders)
+
+    def _analyze_orders(self, orders: List[Order]) -> Dict[str, Any]:
+        if not orders:
+            return {}
+        
+        # Рассчитываем метрики производительности
+        total_profit = Decimal('0')
+        winning_trades = 0
+        losing_trades = 0
+        buy_orders = 0
+        sell_orders = 0
+        
+        for order in orders:
+            if order.profit is not None:
+                total_profit += order.profit
+                if order.profit > 0:
+                    winning_trades += 1
+                elif order.profit < 0:
+                    losing_trades += 1
+                    
+            if order._side == 'buy':
+                buy_orders += 1
+            else:
+                sell_orders += 1
+        
+        total_trades = len(orders)
+        win_rate = winning_trades / total_trades if total_trades > 0 else 0
+        
+        return {
+            "total_orders": total_trades,
+            "buy_orders": buy_orders,
+            "sell_orders": sell_orders,
+            "win_rate": win_rate,
+            "total_profit": str(total_profit),
+            "average_profit": str(total_profit / total_trades) if total_trades > 0 else "0",
+            "profit_factor": winning_trades / losing_trades if losing_trades > 0 else float('inf')
+        }
+    
+# === file: position.py ===
+
+from decimal import Decimal
+from datetime import datetime
+from enum import Enum
+from typing import Any, List, Dict, Optional
+from collections import defaultdict
+
+class PositionStatus(Enum):
+    OPEN = "open"
+    CLOSED = "closed"
+    HEDGED = "hedged"
+
+class Position:
+    def __init__(
+        self,
+        position_id: str,
+        coin: str,
+        strategy: str,
+        initial_size: Decimal,
+        entry_price: Decimal
+    ):
+        self.id = position_id
+        self.coin = coin
+        self.strategy = strategy
+        self.created_at = datetime.utcnow()
+        self.updated_at = self.created_at
+        self.status = PositionStatus.OPEN
+        
+        # Основные метрики
+        self.current_size = initial_size
+        self.entry_price = entry_price
+        self.current_price = entry_price
+        self.realized_pnl = Decimal('0')
+        self.unrealized_pnl = Decimal('0')
+        self.total_fees = Decimal('0')
+        
+        # Детализация сделок
+        self.buys: List[Dict] = []
+        self.sells: List[Dict] = []
+        self.orders: List[str] = []  # IDs связанных ордеров
+        
+        # Аналитические данные
+        self.max_profit = Decimal('0')
+        self.max_drawdown = Decimal('0')
+        self.duration = 0  # в секундах
+        
+        # Рассчитываем начальные значения
+        self._update_pnl()
+
+    def add_order(self, order_id: str, side: str, size: Decimal, price: Decimal, fee: Decimal):
+        """Добавляет ордер к позиции и обновляет метрики"""
+        self.orders.append(order_id)
+        self.updated_at = datetime.utcnow()
+        
+        if side == 'buy':
+            # Обновляем среднюю цену входа
+            total_cost = (self.current_size * self.entry_price) + (size * price)
+            self.current_size += size
+            self.entry_price = total_cost / self.current_size
+            
+            self.buys.append({
+                'order_id': order_id,
+                'size': size,
+                'price': price,
+                'timestamp': self.updated_at
+            })
+        else:  # sell
+            # Реализуем часть позиции
+            realized_size = min(size, self.current_size)
+            realized_pnl = realized_size * (price - self.entry_price)
+            self.realized_pnl += realized_pnl
+            self.current_size -= realized_size
+            
+            self.sells.append({
+                'order_id': order_id,
+                'size': size,
+                'price': price,
+                'timestamp': self.updated_at,
+                'realized_pnl': realized_pnl
+            })
+            
+            # Если позиция закрыта
+            if self.current_size <= Decimal('0.00000001'):  # учет ошибок округления
+                self.close()
+        
+        self.total_fees += fee
+        self._update_pnl()
+
+    def update_price(self, new_price: Decimal):
+        """Обновляет текущую рыночную цену и пересчитывает PnL"""
+        self.current_price = new_price
+        self._update_pnl()
+        self.updated_at = datetime.utcnow()
+
+    def _update_pnl(self):
+        """Пересчитывает реализованный и нереализованный PnL"""
+        # Нереализованный PnL
+        if self.current_size > 0:
+            self.unrealized_pnl = self.current_size * (self.current_price - self.entry_price)
+        else:
+            self.unrealized_pnl = Decimal('0')
+        
+        # Обновляем максимальную прибыль и просадку
+        total_pnl = self.realized_pnl + self.unrealized_pnl
+        if total_pnl > self.max_profit:
+            self.max_profit = total_pnl
+        
+        current_drawdown = self.max_profit - total_pnl
+        if current_drawdown > self.max_drawdown:
+            self.max_drawdown = current_drawdown
+
+    def close(self):
+        """Закрывает позицию"""
+        if self.status == PositionStatus.OPEN:
+            self.status = PositionStatus.CLOSED
+            self.updated_at = datetime.utcnow()
+            self.duration = (self.updated_at - self.created_at).total_seconds()
+            
+            # Финализируем PnL
+            self._update_pnl()
+            self.realized_pnl += self.unrealized_pnl
+            self.unrealized_pnl = Decimal('0')
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "coin": self.coin,
+            "strategy": self.strategy,
+            "status": self.status.value,
+            "size": str(self.current_size),
+            "entry_price": str(self.entry_price),
+            "current_price": str(self.current_price),
+            "realized_pnl": str(self.realized_pnl),
+            "unrealized_pnl": str(self.unrealized_pnl),
+            "total_pnl": str(self.realized_pnl + self.unrealized_pnl),
+            "total_fees": str(self.total_fees),
+            "max_profit": str(self.max_profit),
+            "max_drawdown": str(self.max_drawdown),
+            "duration": self.duration,
+            "created_at": self.created_at.isoformat(),
+            "updated_at": self.updated_at.isoformat(),
+            "num_buys": len(self.buys),
+            "num_sells": len(self.sells)
+        }
+    
+class PositionManager:
+    def __init__(self):
+        self.active_positions: Dict[str, Position] = {}
+        self.closed_positions: Dict[str, Position] = {}
+        self.positions_by_coin = defaultdict(list)
+        self.positions_by_strategy = defaultdict(list)
+        self.position_counter = 0
+
+    def open_position(
+        self,
+        coin: str,
+        strategy: str,
+        size: Decimal,
+        price: Decimal
+    ) -> Position:
+        """Открывает новую позицию"""
+        position_id = f"pos-{self.position_counter}-{datetime.utcnow().strftime('%Y%m%d')}"
+        self.position_counter += 1
+        
+        position = Position(
+            position_id=position_id,
+            coin=coin,
+            strategy=strategy,
+            initial_size=size,
+            entry_price=price
+        )
+        
+        self.active_positions[position_id] = position
+        self.positions_by_coin[coin].append(position_id)
+        self.positions_by_strategy[strategy].append(position_id)
+        
+        return position
+
+    def add_order_to_position(
+        self,
+        position_id: str,
+        order_id: str,
+        side: str,
+        size: Decimal,
+        price: Decimal,
+        fee: Decimal
+    ):
+        """Добавляет ордер к существующей позиции"""
+        if position_id in self.active_positions:
+            position = self.active_positions[position_id]
+            position.add_order(order_id, side, size, price, fee)
+            
+            # Если позиция закрыта, перемещаем в архив
+            if position.status == PositionStatus.CLOSED:
+                self._close_position(position_id)
+
+    def update_position_price(self, position_id: str, price: Decimal):
+        """Обновляет цену для позиции"""
+        if position_id in self.active_positions:
+            self.active_positions[position_id].update_price(price)
+
+    def close_position(self, position_id: str):
+        """Принудительно закрывает позицию"""
+        if position_id in self.active_positions:
+            position = self.active_positions[position_id]
+            position.close()
+            self._close_position(position_id)
+
+    def _close_position(self, position_id: str):
+        """Перемещает позицию в закрытые"""
+        position = self.active_positions.pop(position_id)
+        self.closed_positions[position_id] = position
+
+    def get_position(self, position_id: str) -> Optional[Position]:
+        """Возвращает позицию по ID"""
+        if position_id in self.active_positions:
+            return self.active_positions[position_id]
+        return self.closed_positions.get(position_id)
+
+    def get_position_for_order(self, order_id: str) -> Optional[Position]:
+        """Находит позицию по ID ордера"""
+        for position in self.active_positions.values():
+            if order_id in position.orders:
+                return position
+        for position in self.closed_positions.values():
+            if order_id in position.orders:
+                return position
+        return None
+
+    def get_active_positions(self) -> List[Position]:
+        return list(self.active_positions.values())
+
+    def get_closed_positions(self) -> List[Position]:
+        return list(self.closed_positions.values())
+
+    def calculate_strategy_performance(self, strategy: str) -> Dict[str, Any]:
+        """Анализирует производительность стратегии"""
+        active_positions = []
+        closed_positions = []
+        
+        for position_id in self.positions_by_strategy.get(strategy, []):
+            position = self.get_position(position_id)
+            if position:
+                if position.status == PositionStatus.OPEN:
+                    active_positions.append(position)
+                else:
+                    closed_positions.append(position)
+        
+        return self._analyze_positions(active_positions, closed_positions)
+
+    def _analyze_positions(self, active: List[Position], closed: List[Position]) -> Dict[str, Any]:
+        """Анализирует набор позиций"""
+        total_realized = Decimal('0')
+        total_unrealized = Decimal('0')
+        total_fees = Decimal('0')
+        winning_positions = 0
+        losing_positions = 0
+        
+        for pos in closed:
+            total_realized += pos.realized_pnl
+            total_fees += pos.total_fees
+            if pos.realized_pnl > 0:
+                winning_positions += 1
+            else:
+                losing_positions += 1
+        
+        for pos in active:
+            total_unrealized += pos.unrealized_pnl
+            total_fees += pos.total_fees
+        
+        total_positions = len(active) + len(closed)
+        win_rate = winning_positions / len(closed) if closed else 0
+        
+        return {
+            "total_positions": total_positions,
+            "active_positions": len(active),
+            "closed_positions": len(closed),
+            "win_rate": win_rate,
+            "total_realized_pnl": str(total_realized),
+            "total_unrealized_pnl": str(total_unrealized),
+            "total_fees": str(total_fees),
+            "net_profit": str(total_realized + total_unrealized - total_fees),
+            "avg_position_duration": self._avg_duration(closed),
+            "profit_factor": winning_positions / losing_positions if losing_positions else float('inf')
+        }
+
+    def _avg_duration(self, positions: List[Position]) -> float:
+        """Средняя продолжительность позиций"""
+        if not positions:
+            return 0
+        total_duration = sum(p.duration for p in positions)
+        return total_duration / len(positions)
+    
+# === file: main.py ===
+import os, json, asyncio
+
+from decimal import Decimal, InvalidOperation
+from exchange import OkxExchange
+from coin import Coin
+
+# Определяем, с какими монетами работаем
+COINS = {
+    "USDT": Coin("USDT"),
+    "BTC": Coin("BTC"),
+    "ETH": Coin("ETH"),
+    "SOL": Coin("SOL"),
+    "XRP": Coin("XRP")
+}
+
+async def command_loop():
+    config_path = os.path.join(os.path.dirname(__file__), "okx_config.json")
+    if not os.path.exists(config_path):
+        #self._logger.error(f"Missing config file: {config_path}")
+        raise FileNotFoundError(config_path)
+
+    with open(config_path, "r", encoding="utf-8") as f:
+        config = json.load(f)
+
+    exchange = OkxExchange(config = config, demo = True)
+    worker = None
+    
+    print("Интерактивный клиент OKX. Введите 'help' для списка команд.")
+
+    while True:
+        cmd_line = await asyncio.to_thread(input, "> ")
+        parts = cmd_line.strip().split()
+        if not parts:
+            continue
+        cmd = parts[0].lower()
+
+        try:
+            if   cmd == "help":
+                help_text = """
+                    Доступные команды:
+                    coins --> Показать поддерживаемые символы и их id.
+                    start --> Запустить health-loop.
+                    stop --> Остановить health-loop.
+                    balance --> Показать баланс валюты.
+                    price --> Показать цену SYMBOL.
+                    order --> Разместить лимит‑ордер.
+                    cancel --> Отменить ордер.
+                    cancel_all --> Отменить все ордера по SYMBOL.
+                    status --> Отчёт по состоянию биржи.
+                    help --> Список доступных команд.
+                    quit --> Выход.
+                """
+                print(help_text)
+
+            elif cmd == "coins":
+                print("Торгуемые монеты:")
+                for coin in COINS.values():
+                    print(f"  {coin.symbol_id}")
+            
+            elif cmd == "start":
+                if worker and not worker.done():
+                    print("❗ Run loop уже запущен")
+                    continue
+                await exchange.run()
+                worker = exchange._run_task
+                print("✅ Run loop запущен")
+
+            elif cmd == "stop":
+                if not worker or worker.done():
+                    print("❗ Run loop не запущен")
+                    continue
+                print("⏳ Останавливаю run loop...")
+                await exchange.stop()
+                print("✅ Run loop остановлен")
+
+            elif cmd == "balance":
+                inpt_symbol = parts[1] if len(parts) > 1 else "USDT"
+                symbol = inpt_symbol.upper()
+                
+                coin = COINS.get(symbol)
+                if not coin:
+                    print(f"❌ Монета {symbol} не поддерживается")
+                    continue
+                try:
+                    balance = await exchange.get_balance(coin)
+                    if balance is None:
+                        print(f"❌ Не удалось получить баланс {symbol}")
+                    else:
+                        print(f"💰 Баланс {symbol}: {balance}")
+
+                except Exception as e:
+                    print(f"❌ Ошибка получения баланса: {e}")
+                
+            elif cmd == "price":
+                if len(parts) < 2:
+                    print("❌ Укажите монету, например: price BTC")
+                    continue
+                inpt_symbol = parts[1]
+                symbol = inpt_symbol.upper()
+                coin = COINS.get(symbol)
+                if not coin:
+                    print(f"❌ Монета {symbol} не поддерживается")
+                    continue
+                try:
+                    price = await exchange.get_symbol_price(coin)
+                    print(f"Цена {symbol}: {price}")
+                except Exception as e:
+                    print(f"❌ Ошибка получения цены: {e}")
+                
+            elif cmd == "place_limit_order_by_size":
+                if len(parts) != 5:
+                    print("Использование: place_order SYMBOL SIDE PRICE SIZE")
+                    print("Пример: order BTC buy 50000 0.01 (размер)")
+                    continue
+                
+                inpt_symbol, inpt_side, inpt_price, inpt_size = parts[1:]
+                symbol = inpt_symbol.upper()
+                coin = COINS.get(symbol)
+                if not coin:
+                    print(f"❌ Монета {symbol} не поддерживается")
+                    continue
+                try:
+                    price = Decimal(inpt_price)
+                    size = Decimal(inpt_size)
+                except InvalidOperation:
+                    print("❌ Некорректный формат PRICE или SIZE")
+                    continue
+                
+                side = inpt_side.lower()
+                order_id = await exchange.place_limit_order_by_size(coin, side, price, size)
+                
+                if order_id:
+                    print(f"✅ Ордер размещён, ID: {order_id}")
+                else:
+                    print("❌ Не удалось разместить ордер")
+
+            elif cmd == "place_limit_order_by_amount":
+                if len(parts) != 5:
+                    print("Использование: place_order SYMBOL SIDE PRICE AMOUNT")
+                    print("Пример: order BTC buy 50000 500 (сумма в USDT)")
+                    continue
+            
+                inpt_symbol, inpt_side, inpt_price, inpt_amount = parts[1:]
+                symbol = inpt_symbol.upper()
+                coin = COINS.get(symbol)
+                if not coin:
+                    print(f"❌ Монета {symbol} не поддерживается")
+                    continue
+                try:
+                    price = Decimal(inpt_price)
+                    amount = Decimal(inpt_amount)
+                except InvalidOperation:
+                    print("❌ Некорректный формат PRICE или AMOUNT")
+                    continue
+                
+                side = inpt_side.lower()
+                order_id = await exchange.place_limit_order_by_amount(coin, side, price, amount)
+                
+                if order_id:
+                    print(f"✅ Ордер размещён, ID: {order_id}")
+                else:
+                    print("❌ Не удалось разместить ордер")
+                
+            elif cmd == "cancel_order":
+                if len(parts) < 3:
+                    print("Использование: cancel SYMBOL ORDER_ID")
+                    continue
+                symbol = parts[1].upper()
+                order_id = parts[2]
+                
+                coin = COINS.get(symbol)
+                if not coin:
+                    print(f"❌ Монета {symbol} не поддерживается")
+                    continue
+                    
+                ok = await exchange.cancel_order(coin, order_id)
+                print("✅ Отменено" if ok else "❌ Не удалось отменить")
+
+            elif cmd == "cancel_all_orders":
+                if len(parts) < 2:
+                    print("Использование: cancel_all_orders SYMBOL")
+                    continue
+                symbol = parts[1].upper()
+                
+                coin = COINS.get(symbol)
+                if not coin:
+                    print(f"❌ Монета {symbol} не поддерживается")
+                    continue
+                    
+                canceled = await exchange.cancel_all_orders(coin)
+                if canceled:
+                    print(f"✅ Отменены ордера: {', '.join(canceled)}")
+                else:
+                    print("❌ Нет активных ордеров для отмены")
+
+            elif cmd == "status":
+                report = await exchange.get_status_report()
+                print("📝 Статус биржи:")
+                print(f"  Состояние: {report['state']}")
+                print(f"  Последнее обновление: {report['last_update']}")
+                print(f"  Баланс USDT: {report['balance']}")
+                print(f"  Операционный: {'Да' if report['is_operational'] else 'Нет'}")
+                print(f"  Требует внимания: {'Да' if report['needs_attention'] else 'Нет'}")
+                print("  История состояний:")
+                for state in report['state_history']:
+                    print(f"    - {state['timestamp']}: {state['from']} → {state['to']}")
+
+            elif cmd == "quit":
+                if worker and not worker.done():
+                    print("⏳ Останавливаю перед выходом...")
+                    await exchange.stop()
+                    # Дать время на завершение операций
+                    await asyncio.sleep(0.5)
+                
+                # Явно закрыть соединение
+                await exchange.close()
+                print("👋 До встречи!")
+                break
+
+            else:
+                print(f"❓ Неизвестная команда: {cmd}. Введите 'help'.")
+
+        except Exception as e:
+            print(f"Внутренняя ошибка команды '{cmd}': {e}")
+
+if __name__ == "__main__":
+    asyncio.run(command_loop())

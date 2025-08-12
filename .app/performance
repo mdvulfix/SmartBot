@@ -1,0 +1,16 @@
+# После работы бота
+performance = bot.get_performance_report()
+print(f"Стратегия: {performance['strategy']}")
+print(f"Общая прибыль: {performance['total_profit']} USDT")
+print(f"Процент успешных сделок: {performance['win_rate']*100:.2f}%")
+
+# Анализ отдельных ордеров
+closed_orders = bot.order_manager.get_closed_orders()
+for order in closed_orders:
+    if order.profit is not None:
+        print(f"Ордер {order.id}: {order.side} {order.filled_size} @ {order.filled_price}"
+              f" | Прибыль: {order.profit} | Причина: {order.close_reason}")
+
+# Анализ по монетам
+eth_performance = bot.order_manager.calculate_coin_performance("ETH-USDT")
+print(f"Производительность по ETH: {eth_performance}")
