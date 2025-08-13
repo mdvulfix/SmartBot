@@ -1,0 +1,24 @@
+<!-- templates/task.html -->
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>Task {{ task_id }}</title>
+  </head>
+  <body>
+    <h1>Task {{ task_id }}</h1>
+    <p>Status: {{ task.status }}</p>
+    {% if task.error %}
+      <p style="color:red">Error: {{ task.error }}</p>
+    {% endif %}
+    {% if task.result_html %}
+      <h2>Result</h2>
+      <iframe src="{{ task.result_html }}" width="100%" height="600px"></iframe>
+    {% endif %}
+    <h3>Metrics</h3>
+    {% if task.metrics %}
+      <pre>{{ task.metrics | tojson(indent=2) }}</pre>
+    {% endif %}
+    <p><a href="/">Back</a></p>
+  </body>
+</html>

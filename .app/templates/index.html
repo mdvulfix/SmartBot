@@ -1,0 +1,39 @@
+<!-- templates/index.html -->
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>Backtest UI</title>
+  </head>
+  <body>
+    <h1>Backtest UI</h1>
+    <form action="/start_backtest" method="post" enctype="multipart/form-data">
+      <label>CSV file (timestamp,open,high,low,close,volume):</label><br>
+      <input type="file" name="csv_file" required><br><br>
+
+      <label>Fast SMA:</label>
+      <input type="number" name="fast" value="20"><br>
+
+      <label>Slow SMA:</label>
+      <input type="number" name="slow" value="50"><br>
+
+      <label>Order size:</label>
+      <input type="text" name="size" value="0.001"><br><br>
+
+      <button type="submit">Start Backtest</button>
+    </form>
+
+    <h2>Tasks</h2>
+    <ul>
+      {% for tid, t in tasks.items() %}
+        <li>
+          {{ tid }} — {{ t.status }}
+          {% if t.result_html %}
+            — <a href="{{ t.result_html }}" target="_blank">Result</a>
+          {% endif %}
+          — <a href="/task/{{ tid }}">Details</a>
+        </li>
+      {% endfor %}
+    </ul>
+  </body>
+</html>

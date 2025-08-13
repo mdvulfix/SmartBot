@@ -1,0 +1,37 @@
+import csv
+from decimal import Decimal
+from datetime import datetime
+from models.coin import Coin
+from strategies.sma_strategy import SmaStrategy
+from backtest.runner import BacktestRunner
+
+def load_csv(path):
+    candles = []
+    with open(path, newline='') as f:
+        reader = csv.DictReader(f)
+        for r in reader:
+            ts = r['timestamp']
+            try:
+                ts_val = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            except:
+                ts_val = datetime.utcnow()
+            candles.append({
+                "timestamp": ts_val,
+                "open": Decimal(r["open"]),
+                "high": Decimal(r["high"]),
+                "low": Decimal(r["low"]),
+                "close": Decimal(r["close"]),
+                "volume": Decimal(r.get("volume", "0"))
+            })
+    return candles
+
+candles = load_csv("data/BTCUSDT_1h_sample.csv")
+coin = Coin("BTC")
+strategy = SmaStrategy(coin, fast=20, slow=50, order_size=Decimal("0.001"))
+runner = BacktestRunner(candles, coin, strategy, fee_rate=Decimal("0.0005"), slippage=Decimal("0.0"))
+
+# запуск
+import asyncio
+res = asyncio.run(runner.run())
+print("Trades:", res["trades"])
+print("Positions:", res["positions"])

@@ -188,7 +188,7 @@ class PositionStatus(Enum):
     OPEN = "open"
     CLOSED = "closed"
 
-
+@dataclass
 class Position:
     """Агрегированная информация о торговой позиции"""
     def __init__(self, id: str, coin: str, strategy: str, size: Decimal, price: Decimal):

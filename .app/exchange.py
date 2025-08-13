@@ -208,7 +208,7 @@ class OkxExchange(Exchange):
                 return
             self._balance = balance
 
-            if self.balance < Decimal("10"):
+            if self._balance < Decimal("10"):
                 self._update_state(ExchangeState.BALANCE_LOW)
             else:
                 self._update_state(ExchangeState.ACTIVE)
@@ -585,7 +585,7 @@ class OkxExchange(Exchange):
     
     def _update_state(self, new_state: ExchangeState):
         if self._state != new_state:
-            now = datetime.now(datetime.timezone.utc)
+            now = datetime.now(timezone.utc)
             self._state_history.append({
                 "timestamp": now,
                 "from": self._state.name,

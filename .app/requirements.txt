@@ -1,0 +1,7 @@
+fastapi
+uvicorn[standard]
+jinja2
+pandas
+plotly
+aiofiles
+aiohttp>=3.9.0
