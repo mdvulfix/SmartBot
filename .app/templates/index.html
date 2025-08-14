@@ -1,39 +1,28 @@
-<!-- templates/index.html -->
-<!doctype html>
+<!DOCTYPE html>
 <html>
-  <head>
-    <meta charset="utf-8">
-    <title>Backtest UI</title>
-  </head>
-  <body>
-    <h1>Backtest UI</h1>
-    <form action="/start_backtest" method="post" enctype="multipart/form-data">
-      <label>CSV file (timestamp,open,high,low,close,volume):</label><br>
-      <input type="file" name="csv_file" required><br><br>
-
-      <label>Fast SMA:</label>
-      <input type="number" name="fast" value="20"><br>
-
-      <label>Slow SMA:</label>
-      <input type="number" name="slow" value="50"><br>
-
-      <label>Order size:</label>
-      <input type="text" name="size" value="0.001"><br><br>
-
-      <button type="submit">Start Backtest</button>
+<head>
+    <title>OKX Backtest</title>
+</head>
+<body>
+    <h2>Backtest на реальных данных OKX (SWAP)</h2>
+    <form method="get" action="/">
+        Монета: <input type="text" name="symbol" value="{{ symbol or 'BTC' }}" required>
+        Таймфрейм:
+        <select name="bar">
+            <option value="1m">1m</option>
+            <option value="5m">5m</option>
+            <option value="15m">15m</option>
+            <option value="1H" selected>1H</option>
+            <option value="1D">1D</option>
+        </select>
+        Начало: <input type="date" name="start" value="{{ start }}">
+        Конец: <input type="date" name="end" value="{{ end }}">
+        <input type="submit" value="Запустить">
     </form>
 
-    <h2>Tasks</h2>
-    <ul>
-      {% for tid, t in tasks.items() %}
-        <li>
-          {{ tid }} — {{ t.status }}
-          {% if t.result_html %}
-            — <a href="{{ t.result_html }}" target="_blank">Result</a>
-          {% endif %}
-          — <a href="/task/{{ tid }}">Details</a>
-        </li>
-      {% endfor %}
-    </ul>
-  </body>
+    {% if plot_html %}
+        <h3>График цены</h3>
+        {{ plot_html|safe }}
+    {% endif %}
+</body>
 </html>

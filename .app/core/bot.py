@@ -8,7 +8,7 @@ from abc import ABC, abstractmethod
 from decimal import Decimal
 from typing import Dict, Optional, Tuple, Any
 
-from utils.logger import get_logger
+from logger import get_logger
 from core.exchange import Exchange
 from core.exceptions import ExchangeError, StrategyError
 from core.strategy import Strategy

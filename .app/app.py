@@ -92,7 +92,7 @@ async def run_backtest_task(task_id: str, csv_path: str, fast: int, slow: int, s
         fig.update_layout(title=f"Backtest {task_id}", xaxis_rangeslider_visible=False)
 
         html_path = RESULTS_DIR / f"{task_id}.html"
-        pio.write_html(fig, file=str(html_path), auto_open=False, include_plotlyjs='cdn')
+        pio.write_html(fig, file=str(html_path), auto_open=False)
 
         TASKS[task_id]['status'] = 'done'
         TASKS[task_id]['result_html'] = f"/results/{task_id}.html"

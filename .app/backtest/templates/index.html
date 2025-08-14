@@ -1,0 +1,57 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Backtest UI</title>
+  <style>
+    body { font-family: Arial, Helvetica, sans-serif; background:#0f1720; color:#e6eef8; padding:20px; }
+    .card { background:#0b1220; padding:16px; border-radius:8px; margin-bottom:16px; }
+    label { display:inline-block; width:100px; }
+    .error { color: #ff8080; margin-top:8px; white-space:pre-wrap; }
+  </style>
+</head>
+<body>
+  <h1>OKX Backtest (SWAP)</h1>
+
+  <div class="card">
+    <form action="/" method="get">
+      <div>
+        <label>Монета</label>
+        <input name="symbol" value="{{ symbol or 'BTC' }}" placeholder="BTC">
+      </div>
+      <div>
+        <label>Таймфрейм</label>
+        <select name="bar">
+          <option value="1m" {% if bar=='1m' %}selected{% endif %}>1m</option>
+          <option value="5m" {% if bar=='5m' %}selected{% endif %}>5m</option>
+          <option value="15m" {% if bar=='15m' %}selected{% endif %}>15m</option>
+          <option value="1H" {% if bar=='1H' %}selected{% endif %}>1H</option>
+          <option value="1D" {% if bar=='1D' %}selected{% endif %}>1D</option>
+        </select>
+      </div>
+      <div>
+        <label>Start</label>
+        <input type="date" name="start" value="{{ start or '' }}">
+      </div>
+      <div>
+        <label>End</label>
+        <input type="date" name="end" value="{{ end or '' }}">
+      </div>
+      <div style="margin-top:10px;">
+        <button type="submit">Запустить</button>
+      </div>
+    </form>
+
+    {% if error %}
+      <div class="error">Ошибка: {{ error | safe }}</div>
+    {% endif %}
+  </div>
+
+  {% if plot_html %}
+    <div class="card">
+      {{ plot_html | safe }}
+    </div>
+  {% endif %}
+
+</body>
+</html>

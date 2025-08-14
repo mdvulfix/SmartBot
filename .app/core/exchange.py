@@ -15,7 +15,7 @@ from typing import Any, Optional, List, Dict, Tuple
 from models.coin import Coin
 from core.exceptions import ConfigurationError, ExchangeError
 
-from utils.logger import get_logger
+from logger import get_logger
 
 
 class ExchangeState(Enum):
